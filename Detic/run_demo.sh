@@ -1,0 +1,1 @@
+python batched_inference.py --config-file configs/Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.yaml --input /projects/katefgroup/datasets/OVT-DAVIS/sub1/trainval/JPEGImages/Full-Resolution/longboard/ --output ./out/ --vocabulary lvis --opts MODEL.WEIGHTS models/Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.pth

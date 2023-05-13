@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+Detic/models/*.pth
+Detic/third_party/gmflow/pretrained/*.pth
+Detic/third_party/SAM/pretrained/*.pth
+Detic/third_party/SAM/out_tta_fb/

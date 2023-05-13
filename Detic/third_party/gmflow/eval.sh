@@ -1,0 +1,12 @@
+CUDA_VISIBLE_DEVICES=0 python eval_yv.py \
+--inference_dir /projects/katefgroup/datasets/OVT-Youtube/all_frames/valid_all_frames/JPEGImages_480 \
+--output_path /projects/katefgroup/datasets/OVT-Youtube/all_frames/valid_all_frames/Flow_480 \
+--pred_bidir_flow \
+--save_flo_flow \
+--resume pretrained/gmflow_with_refine_sintel-3ed1cf48.pth \
+--padding_factor 32 \
+--upsample_factor 4 \
+--num_scales 2 \
+--attn_splits_list 2 4 \
+--corr_radius_list -1 4 \
+--prop_radius_list -1 1
