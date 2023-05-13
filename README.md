@@ -41,7 +41,10 @@ DETIC weights should go in:
 ```
 ovt/Detic/models/Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.pth
 ```
-SAM wweights should go in:
+SAM weights should go in:
 ```
 ovt/Detic/third_party/SAM/pretrained/sam_vit_h_4b8939.pth
 ```
+
+# run tracker
+Please see the eval.sh files under ovt/Detic/third_party/SAM
