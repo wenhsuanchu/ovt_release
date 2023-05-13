@@ -34,7 +34,8 @@ conda env update --file local.yml
 
 # download weights
 GMFlow weights should go in:
-```ovt/Detic/third_party/gmflow/pretrained/gmflow_with_refine_sintel-3ed1cf48.pth
+```
+ovt/Detic/third_party/gmflow/pretrained/gmflow_with_refine_sintel-3ed1cf48.pth
 ```
 DETIC weights should go in:
 ```
