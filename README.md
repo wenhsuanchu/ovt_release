@@ -1,11 +1,13 @@
 # ovt
-```conda create --name ovt python=3.8 -y
+```
+conda create --name ovt python=3.8 -y
 conda activate ovt
 conda install pytorch torchvision torchaudio cudatoolkit=11.1 -c pytorch-lts -c nvidia
 ```
 
 # install detectron2
-```git clone git@github.com:facebookresearch/detectron2.git
+```
+git clone git@github.com:facebookresearch/detectron2.git
 cd detectron2
 pip install -e .
 ```
