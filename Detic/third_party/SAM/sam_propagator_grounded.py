@@ -3,6 +3,27 @@ import collections
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from detectron2.structures import Instances, Boxes
+from groundingdino.util.inference import load_model, load_image, predict, annotate
+from torchvision.ops import box_convert
+import groundingdino.datasets.transforms as GDT
+from PIL import Image
+
+from utils.flow import run_flow_on_images
+
+def get_unique_masks(predictions):
+
+    raw_boxes = predictions["instances"].pred_boxes.tensor
+    unique_masks = [predictions["instances"].pred_masks[0]]
+    mask_labels = [predictions["instances"].pred_classes[0]]
+    for idx in range(1, len(raw_boxes)):
+        if not torch.allclose(raw_boxes[idx], raw_boxes[idx-1]):
+            unique_masks.append(predictions["instances"].pred_masks[idx])
+            mask_labels.append(predictions["instances"].pred_classes[idx])
+
+    unique_masks = torch.stack(unique_masks)
+    mask_labels = torch.stack(mask_labels)
+
+    return unique_masks, mask_labels
 
 def masks_to_boxes(mask: torch.Tensor) -> torch.Tensor:
     """
@@ -39,11 +60,14 @@ def masks_to_boxes(mask: torch.Tensor) -> torch.Tensor:
     return bounding_boxes
 
 class Propagator:
-    def __init__(self, prop_net, detector, images, num_objects, det_aug):
+    def __init__(self, prop_net, detector, grounded_detector, flow_predictor, images, num_objects, det_aug, caption):
         self.prop_net = prop_net
         self.detector = detector
+        self.grounded_detector = grounded_detector
+        self.flow_predictor = flow_predictor
 
         self.det_aug = det_aug
+        self.caption = caption
         
         self.k = num_objects
 
@@ -56,32 +80,34 @@ class Propagator:
         self.images = images
         self.device = prop_net.device
 
-        self.gt_instance_ids = []
-
         # Background included, not always consistent (i.e. sum up to 1)
-        self.prob = [torch.zeros((0, 1, nh, nw), dtype=torch.float32, device=self.device)] * self.t
+        self.prob = [torch.zeros((self.k, 1, nh, nw), dtype=torch.float32, device=self.device)] * self.t
+        self.prob[0] = 1e-7
 
         # Tells us which instance ids are in self.prob (starts from 1)
-        self.valid_instances = [ [] for _ in range(self.t) ]
-        self.total_instances = num_objects
+        self.valid_instances = [torch.tensor([0], device=self.device)] * self.t
+        self.total_instances = 0
 
         # Re-ID instance mappings
-        self.feat_hist = [collections.deque(maxlen=10) for _ in range(self.k)]
+        self.feat_hist = []
         self.reid_instance_feats = []
         self.new_instance_feats = []
         self.new_instance_ids = []
         self.reid_instance_mappings = collections.OrderedDict()
 
-    def do_pass(self, idx, end_idx, fwd_flow, bwd_flow, detected, max_tracklets=15):
+    def do_pass(self, idx, end_idx, max_tracklets):
 
-        # First get prev featmaps at start_idx
+        # First get box feats at start_idx
         start_boxes = []
         for instance_mask in self.prob[idx]:
+            self.feat_hist.append(collections.deque(maxlen=10))
             instance = instance_mask[0]
             orig_box = masks_to_boxes(instance)
             start_boxes.append(orig_box)
         start_boxes = torch.stack(start_boxes)
-        start_boxes, _ = self._refine_boxes(self.images[idx].numpy(), Boxes(start_boxes.cuda()))
+        start_boxes, start_box_feats = self._refine_boxes(self.images[idx].numpy(), Boxes(start_boxes.cuda()))
+        for i, start_box_feat in enumerate(start_box_feats):
+            self.feat_hist[i].append(start_box_feat)
 
         self.prop_net.set_image(self.images[idx].numpy().astype(np.uint8))
         transformed_boxes = self.prop_net.transform.apply_boxes_torch(torch.round(start_boxes).long().to(self.prop_net.device),
@@ -108,6 +134,11 @@ class Propagator:
             prev_valid_masks = []
             prev_valid_embeddings = []
 
+            # Get flow
+            fwd_flow, bwd_flow = run_flow_on_images(self.flow_predictor, self.images[ti-1:ti+1])
+            fwd_flow = torch.from_numpy(fwd_flow[0]).to(self.device)
+            bwd_flow = torch.from_numpy(bwd_flow[0]).to(self.device)
+
             for prob_id, instance_mask in enumerate(self.prob[ti-1]):
 
                 instance = instance_mask[0]
@@ -115,7 +146,7 @@ class Propagator:
                 orig_box = masks_to_boxes(instance)
 
                 # Skip instance and kill tracklet if needed
-                is_consistent, prop_idxes = self._calc_flow_consistency(instance, fwd_flow[ti-1], bwd_flow[ti-1])
+                is_consistent, prop_idxes = self._calc_flow_consistency(instance, fwd_flow, bwd_flow)
                 if not is_consistent:
                     print(ti, "Killing", self.valid_instances[ti-1][prob_id])
                     # If a new instance died before it got re-ided, then just remove the entry from new instances
@@ -133,7 +164,7 @@ class Propagator:
                 idxes = idxes[torch.nonzero(idxes_valid).squeeze(1)]
                 sampled_pts = idxes.to(self.device)
                 # Warp boxes
-                warped_box = self._propagate_boxes(sampled_pts, fwd_flow[ti-1], orig_box)
+                warped_box = self._propagate_boxes(sampled_pts, fwd_flow, orig_box)
                 boxes.append(warped_box)
                 valid_instances.append(self.valid_instances[ti-1][prob_id])
 
@@ -145,7 +176,8 @@ class Propagator:
             # For now we'll just set all mask predictions to zero
             if len(boxes) == 0:
                 all_boxes.append(boxes)
-                out_masks = torch.zeros((0,)+self.prob[0].shape[1:])
+                out_masks = torch.zeros((0,)+self.prob[0].shape[1:], device=self.device)
+                embeddings = torch.zeros((0,)+prev_embeddings.shape[1:], device=self.device)
             else:
                 # Refine boxes using box regressor
                 boxes = torch.stack(boxes)
@@ -160,7 +192,7 @@ class Propagator:
                 self.prop_net.set_image(self.images[ti].numpy().astype(np.uint8))
                 transformed_boxes = self.prop_net.transform.apply_boxes_torch(boxes.to(self.prop_net.device),
                                                                             self.images[ti].shape[:2])
-                '''out_masks, _, _, _, embeddings = self.prop_net.predict_torch(
+                '''out_masks, _, _ = self.prop_net.predict_torch(
                     point_coords=None,
                     point_labels=None,
                     boxes=transformed_boxes,
@@ -203,7 +235,7 @@ class Propagator:
                 out_masks = best_out_masks
 
             # Merge with detections
-            detected_ti = detected[ti][0].cuda()
+            detected_ti = self._run_detector(self.images[ti].numpy()).cuda()
             if len(detected_ti) > 0:
                 if out_masks.shape[0] > 0:
                     merged_mask, valid_instances = self._merge_detections_and_propagations(self.images[ti].numpy(),
@@ -224,48 +256,24 @@ class Propagator:
 
             self.prob[ti] = merged_mask
             if len(valid_instances) > 0:
-                self.valid_instances[ti] = valid_instances
+                self.valid_instances[ti] = torch.stack(valid_instances)
             prev_embeddings = embeddings
-            #print("MERGED", ti, merged_mask.shape, self.valid_instances[ti])
+            #print("MERGED", ti, merged_mask.shape)
 
         return closest_ti, all_boxes
 
-    def interact(self, mask, frame_idx, end_idx, obj_idx, fwd_flow, bwd_flow, detected):
+    def interact(self, mask, frame_idx, end_idx, max_tracklets=75):
 
-        # Init starting frame
+        # Only select a subset of masks so we don't track too many at once
+        mask = mask[:max_tracklets]
 
-        # For now, we reset new instances so we don't Re-ID an instance to itself
-        self.new_instance_ids = []
-        # It is possible that we've already spawned a tracklet for the "new" instance when we call this function
-        # So we add the existing list of tracklets to the re-id list
-        if len(self.valid_instances[frame_idx]) > 0:
-            for prob_id, _ in enumerate(self.prob[frame_idx]):
-                #print(frame_idx, "ADD TO REID", self.valid_instances[frame_idx][prob_id])
-                self.reid_instance_feats.append({"id": self.valid_instances[frame_idx][prob_id],
-                                                 "feat": torch.stack(list(self.feat_hist[self.valid_instances[frame_idx][prob_id]-1]))})
-                self.new_instance_ids.extend(obj_idx)
-        # Add new instances to existing tracklets        
-        #print("ORIG PROB", frame_idx, "SHAPE", self.prob[frame_idx].shape)
-        self.prob[frame_idx] = torch.cat([self.prob[frame_idx], mask.to(self.device)])
-        #print("INIT PROB", frame_idx, "SHAPE", self.prob[frame_idx].shape)
-        self.valid_instances[frame_idx].extend(obj_idx)
-        self.gt_instance_ids.extend(obj_idx)
-        print("GT IDS", self.gt_instance_ids, "MSK SHAPE", mask.shape)
-        #print("VALID INIT", frame_idx, self.valid_instances[frame_idx])
-        
-        # Initialize feature history using box feats at start_idx
-        start_boxes = []
-        for instance_mask in mask:
-            instance = instance_mask[0]
-            orig_box = masks_to_boxes(instance)
-            start_boxes.append(orig_box)
-        start_boxes = torch.stack(start_boxes)
-        _, start_box_feats = self._refine_boxes(self.images[frame_idx].numpy(), Boxes(start_boxes.cuda()))
-        for i, start_box_feat in enumerate(start_box_feats):
-            self.feat_hist[obj_idx[i]-1].append(start_box_feat)
+        # Init frame 0
+        self.prob[frame_idx] = mask.to(self.device)
+        self.valid_instances[frame_idx] = torch.arange(mask.shape[0], device=self.device) + 1
+        self.total_instances = mask.shape[0]
 
         # Track from frame 1 ~ end
-        _, boxes = self.do_pass(frame_idx, end_idx, fwd_flow.to(self.device), bwd_flow.to(self.device), detected)
+        _, boxes = self.do_pass(frame_idx, end_idx, max_tracklets)
 
         return boxes
     
@@ -300,6 +308,45 @@ class Propagator:
         else:
             return False, None
 
+    def _run_detector(self, img):
+
+        gdino_transform = GDT.Compose(
+            [
+                GDT.RandomResize([800], max_size=1333),
+                GDT.ToTensor(),
+                GDT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+        img_transformed, _ = gdino_transform(Image.fromarray(img), None)
+
+        with torch.no_grad():
+            boxes, logits, phrases = predict(
+                model=self.grounded_detector,
+                image=img_transformed,
+                caption=self.caption,
+                box_threshold=0.45,
+                text_threshold=0.45
+            )
+
+            if len(boxes) == 0:
+                masks = torch.zeros((0,)+self.prob[0].shape[1:], device=self.device)
+            else:
+                xyxy = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
+                xyxy[:, ::2] = xyxy[:, ::2] * img.shape[1]
+                xyxy[:, 1::2] = xyxy[:, 1::2] * img.shape[0]
+
+                self.prop_net.set_image(img.astype(np.uint8))
+                transformed_boxes = self.prop_net.transform.apply_boxes_torch(torch.from_numpy(xyxy).to(self.prop_net.device), img.shape[:2])
+
+                masks, _, _, _, _ = self.prop_net.predict_torch(
+                    point_coords=None,
+                    point_labels=None,
+                    boxes=transformed_boxes,
+                    multimask_output=False,
+                )
+
+        return masks
+    
     def _merge_detections_and_propagations(self, img, detection, propagation, valid_instances, max_tracklets):
 
         # High IOU requirement for mask replacement
@@ -396,7 +443,7 @@ class Propagator:
                     killed_box_feat_ids.append(torch.full((len(entry["feat"]),), entry["id"]))
                     killed_box_feats.append(torch.stack(list(entry["feat"])))
             if len(killed_box_feat_ids) == 0:
-                return 0
+                return
             killed_box_feat_ids = torch.cat(killed_box_feat_ids) # [KILLED]
             killed_box_feats = torch.cat(killed_box_feats).unsqueeze(0) # [1, KILLED, C]
             killed_box_feats = killed_box_feats / torch.norm(killed_box_feats, dim=-1, keepdim=True)
@@ -418,8 +465,7 @@ class Propagator:
                         # TODO: Check why this fails on kite-surf
                         self.new_instance_ids.remove(new_id)
                     for entry in self.reid_instance_feats:
-                        if entry["id"].item() == old_id and old_id not in self.gt_instance_ids:
-                            print("REMOVING", entry["id"].item(), "FROM REID")
+                        if entry["id"].item() == old_id:
                             self.reid_instance_feats.remove(entry)
 
                     reid_count += 1
@@ -487,6 +533,31 @@ class Propagator:
             matched_idxes = torch.stack(matched_idxes)
 
         return matched_idxes
+    
+    '''def _find_nonoverlapping_masks(self, detected, gt, thresh=0.1):
+
+        # Detected: [N, 1, H, W]
+        # GT: [N2, 1, H, W]
+
+        # Convert to boolean masks
+        detected = (detected.float() > 0.5).bool() # [N1, 1, H, W]
+        gt = (gt.float() > 0.5).bool().permute(1,0,2,3) # [1, N2, H, W]
+
+        intersection = torch.logical_and(detected, gt).float().sum((-2, -1))
+        instance_size = detected.float().sum((-2, -1))
+        
+        iou = (intersection + 1e-6) / (instance_size + 1e-6) # [N1, N2]
+        thresholded = iou # When we add semantic label thresholding
+        row_idx, col_idx = linear_sum_assignment(-thresholded.cpu()) # Score -> cost
+        matched_idxes = torch.stack([torch.from_numpy(row_idx), torch.from_numpy(col_idx)], axis=1)
+        matched_score = iou[row_idx, col_idx]
+        matched_idxes = matched_idxes[torch.nonzero(matched_score>thresh).flatten()] # [N, 2] or [2]
+        # This happens when we only have one pair of masks matched
+        # It makes subsequent functions so we unsqueeze for an extra dimension
+        if len(matched_idxes.shape) == 1:
+            matched_idxes = matched_idxes[None, :]
+
+        return matched_idxes'''
 
     def _propagate_boxes(self, sampled_pts, fwd_flow, orig_box):
 
@@ -504,11 +575,6 @@ class Propagator:
         warped_pts[:, 0] = torch.clamp(warped_pts[:, 0], 0, H-1)
         warped_pts[:, 1] = torch.clamp(warped_pts[:, 1], 0, W-1)
         warped_pts = warped_pts.long()
-
-        #min_y = torch.min(warped_pts[:, 0])
-        #max_y = torch.max(warped_pts[:, 0])
-        #min_x = torch.min(warped_pts[:, 1])
-        #max_x = torch.max(warped_pts[:, 1])
 
         # Solve for the scale and translation
         A = torch.zeros((sampled_pts.shape[0]*2, 4), device=self.device)

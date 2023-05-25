@@ -1,7 +1,9 @@
 import numpy as np
+import sys
 import torch
 import matplotlib
 matplotlib.use('Agg')
+sys.path.insert(0, '../GroundingDINO/')
 import matplotlib.pyplot as plt
 import time
 import os
@@ -11,13 +13,16 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from PIL import Image
 from scipy.optimize import linear_sum_assignment
+import groundingdino.datasets.transforms as T
 import torch.multiprocessing
+from groundingdino.util.inference import load_model, load_image, predict, annotate
+from torchvision.ops import box_convert
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 from progressbar import progressbar
 
-from davis_test_dataset_npz import DAVISTestDataset
-from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+from dataset.davis_dataset import DAVISTestDataset
+from segment_anything import sam_model_registry, SamPredictor, SamCustomPredictor
 
 CKPT_PATH = "/home/wenhsuac/ovt/Detic/third_party/SAM/pretrained/sam_vit_h_4b8939.pth"
 
@@ -70,11 +75,14 @@ model_type = "vit_h"
 
 device = "cuda"
 
+gdino = load_model("/home/wenhsuac/ovt/Detic/third_party/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+                   "/home/wenhsuac/ovt/Detic/third_party/GroundingDINO/weights/groundingdino_swint_ogc.pth")
+
 sam = sam_model_registry["vit_h"](checkpoint=CKPT_PATH)
 sam.to(device=device)
 predictor = SamPredictor(sam)
 
-test_dataset = DAVISTestDataset(davis_path, resolution=(480,720), imset='2017/debug.txt')
+test_dataset = DAVISTestDataset(davis_path, resolution=(480,720), imset='2017/debug2.txt')
 test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
 
 for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout=True):
@@ -82,35 +90,42 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
     torch.cuda.empty_cache()
 
     rgb = data['rgb'] # [B, S, C, H, W]
-    detections = data['detections']
-    detected_boxes = data['detected_boxes'] # list([B, N, 4])
     msk = data['gt'][0].to(sam.device)
     info = data['info']
     name = info['name'][0]
-    k = min(msk.shape[0], detections[0].shape[1])
     size = info['shape']
     torch.cuda.synchronize()
     process_begin = time.time()
 
     #rgb = np.array(Image.open("truck.jpg").convert('RGB'))
     #print(rgb.shape)
-    '''im_transform = transforms.Compose([
-        transforms.ToTensor()
-    ])
-    rgb = im_transform(rgb).permute(1,2,0)'''
-    '''input_boxes = torch.tensor([
-        [75, 275, 1725, 850],
-        [425, 600, 700, 875],
-        [1375, 550, 1650, 800],
-        [1240, 675, 1400, 750],
-    ], device=predictor.device)'''
 
-    print(rgb.shape)
-    print(data['detected_boxes'][0].shape)
+    img = rgb[0, 0].numpy()
+    #height, width = img.shape[:2]
+    gdino_transform = T.Compose(
+        [
+            T.RandomResize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    img_transformed, _ = gdino_transform(Image.fromarray(rgb[0, 0].numpy()), None)
+
+    boxes, logits, phrases = predict(
+            model=gdino,
+            image=img_transformed,
+            caption="dog most to the right",
+            box_threshold=0.35,
+            text_threshold=0.25
+        )
+
+    xyxy = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
+    xyxy[:, ::2] = xyxy[:, ::2] * img.shape[1]
+    xyxy[:, 1::2] = xyxy[:, 1::2] * img.shape[0]
 
     predictor.set_image(rgb[0, 0].numpy().astype(np.uint8))
     #predictor.set_image(rgb.astype(np.uint8))
-    transformed_boxes = predictor.transform.apply_boxes_torch(detected_boxes[0][0][:10].to(sam.device), rgb[0][0].shape[:2])
+    transformed_boxes = predictor.transform.apply_boxes_torch(torch.from_numpy(xyxy).to(sam.device), rgb[0][0].shape[:2])
     #transformed_boxes = predictor.transform.apply_boxes_torch(input_boxes.to(sam.device), rgb.shape[:2])
 
     masks, _, _ = predictor.predict_torch(
@@ -120,7 +135,7 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
         multimask_output=False,
     )
 
-    print(detected_boxes[0][0][:10])
+    print(xyxy)
     print(masks.shape)
 
     fig = plt.figure(figsize=(10, 10))
@@ -128,8 +143,10 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
     #plt.imshow(rgb)
     for mask in masks:
         show_mask(mask.cpu().numpy(), plt.gca(), random_color=True)
-    for box in detected_boxes[0][0][:10]:
+    for box in xyxy:
     #for box in input_boxes:
-        show_box(box.cpu().numpy(), plt.gca())
+        show_box(box, plt.gca())
     plt.axis('off')
     fig.savefig('temp.png', dpi=fig.dpi, bbox_inches='tight', pad_inches=0.0)
+
+    assert(False)

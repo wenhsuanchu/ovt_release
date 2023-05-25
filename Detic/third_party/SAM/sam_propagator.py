@@ -280,31 +280,31 @@ class Propagator:
         # High IOU requirement for mask replacement
         matched_idxes = self._find_matching_masks(propagation, detection)
         # Low IOU requirement for spawning new tracklets
-        matched_idxes_low = self._find_nonoverlapping_masks(propagation, detection, thresh=0.1)
+        matched_idxes_low = self._find_nonoverlapping_masks(detection, propagation, thresh=0.7)
 
         # Figure out how many instances there are in the two frames
         num_instances = propagation.shape[0] + detection.shape[0] - len(matched_idxes_low)
-        num_instances = max(num_instances, propagation.shape[0])
-        # If we don't have too many objects yet, then allow new tracklets to spawn
-        if num_instances < max_tracklets:
-
-            merged_mask = torch.zeros((num_instances,)+self.prob[0].shape[1:], device=self.prob[0].device)
-            # Handle instances from the first frame
-            for label_idx in range(propagation.shape[0]):
-                if label_idx in matched_idxes[:, 0]:
-                    # If high IOU, use detections
-                    detected_idx = matched_idxes[(matched_idxes[:, 0] == label_idx).nonzero().squeeze(1), 1]
-                    merged_mask[label_idx] = detection[detected_idx]
-                else:
-                    # Otherwise use propagation
-                    merged_mask[label_idx] = propagation[label_idx]
-            # Handle (new) instances detected in the second frame
-            # We match using lower thresholds to prevent over-initializing
-            curr_instance_idx = propagation.shape[0]
-            for label_idx in range(detection.shape[0]):
-                if label_idx not in matched_idxes_low[:, 1]:
-                    merged_mask[curr_instance_idx] = detection[label_idx]
-                    curr_instance_idx += 1
+        num_instances = min(num_instances, max_tracklets)
+        merged_mask = torch.zeros((num_instances,)+self.prob[0].shape[1:], device=self.prob[0].device)
+        # Handle (existing) instances from frame 1
+        curr_instance_count = propagation.shape[0]
+        for label_idx in range(propagation.shape[0]):
+            if label_idx in matched_idxes[:, 0]:
+                # If high IOU, use detections
+                detected_idx = matched_idxes[(matched_idxes[:, 0] == label_idx).nonzero().squeeze(1), 1]
+                merged_mask[label_idx] = detection[detected_idx]
+            else:
+                # Otherwise use propagation
+                merged_mask[label_idx] = propagation[label_idx]
+        # If we don't have too many objects yet, then allow new tracks to spawn
+        # This handles (new) instances detected in the second frame
+        for label_idx in range(detection.shape[0]):
+            # Check if the detection is "new"
+            if label_idx not in matched_idxes_low[:, 0]:
+                # Make sure we don't have too many tracks
+                if curr_instance_count < max_tracklets:
+                    merged_mask[curr_instance_count] = detection[label_idx]
+                    curr_instance_count += 1
                     valid_instances.append(torch.tensor(self.total_instances+1, device=self.device))
                     self.feat_hist.append(collections.deque(maxlen=10))
 
@@ -313,20 +313,9 @@ class Propagator:
                     self.new_instance_ids.append(self.total_instances+1)
 
                     self.total_instances += 1
-
-        # Otherwise we skip the parts that generate new tracklets
-        else:
-            merged_mask = torch.zeros_like(propagation)
-            num_instances = propagation.shape[0] # Adjust num_instances
-            # Handle instances from the first frame
-            for label_idx in range(propagation.shape[0]):
-                if label_idx in matched_idxes[:, 0]:
-                    # If high IOU, use detections
-                    detected_idx = matched_idxes[(matched_idxes[:, 0] == label_idx).nonzero().squeeze(1), 1]
-                    merged_mask[label_idx] = detection[detected_idx]
+                # Otherwise we are done
                 else:
-                    # Otherwise use propagation
-                    merged_mask[label_idx] = propagation[label_idx]
+                    break
         #print(ti, merged_mask.shape, out_labels.shape, detection.shape, len(matched_idxes_low))
 
         return merged_mask, valid_instances
@@ -421,27 +410,31 @@ class Propagator:
         # masks2: [N2, 1, H, W]
 
         # Convert to boolean masks
-        masks1 = (masks1.float() > 0.5).bool() # [N1, 1, H, W]
-        masks2 = (masks2.float() > 0.5).bool().permute(1,0,2,3) # [1, N2, H, W]
+        N1, _, H, W = masks1.shape
+        N2, _, H, W = masks2.shape
+        masks1 = (masks1.float() > 0.5).float().squeeze(1).reshape(N1, H*W)
+        masks2 = (masks2.float() > 0.5).float().squeeze(1).reshape(N2, H*W)
+        intersection = torch.matmul(masks1, masks2.t())
 
-        intersection = torch.logical_and(masks1, masks2).float().sum((-2, -1))
-        union = torch.logical_or(masks1, masks2).float().sum((-2, -1))
+        area1 = masks1.sum(dim=1).view(1, N1)
+        area2 = masks2.sum(dim=1).view(1, N2)
+        union = (area1.t() + area2) - intersection
         
         iou = (intersection + 1e-6) / (union + 1e-6) # [N1, N2]
 
         return iou
     
-    def _find_matching_masks(self, detected, gt, iou_thresh=0.8):
+    def _find_matching_masks(self, propagation, detected, iou_thresh=0.8):
 
-        # Detected: [N, 1, H, W]
-        # GT: [N2, 1, H, W]
+        # Propagation: [N, 1, H, W]
+        # Detected: [N2, 1, H, W]
         
-        iou = self._calc_iou(detected, gt) # [N1, N2]
+        iou = self._calc_iou(propagation, detected) # [N1, N2]
         thresholded = iou # When we add semantic label thresholding
         row_idx, col_idx = linear_sum_assignment(-thresholded.cpu()) # Score -> cost
         matched_idxes = torch.stack([torch.from_numpy(row_idx), torch.from_numpy(col_idx)], axis=1)
         matched_score = iou[row_idx, col_idx]
-        matched_idxes = matched_idxes[torch.nonzero(matched_score>iou_thresh).flatten()] # [N, 2] or [2]
+        matched_idxes = matched_idxes[torch.nonzero(matched_score>iou_thresh).flatten().cpu()] # [N, 2] or [2]
         # This happens when we only have one pair of masks matched
         # It makes subsequent functions so we unsqueeze for an extra dimension
         if len(matched_idxes.shape) == 1:
@@ -449,28 +442,23 @@ class Propagator:
 
         return matched_idxes
     
-    def _find_nonoverlapping_masks(self, detected, gt, thresh=0.1):
+    def _find_nonoverlapping_masks(self, detected, masks, thresh=0.1):
 
         # Detected: [N, 1, H, W]
-        # GT: [N2, 1, H, W]
+        # Masks: [N2, 1, H, W]
 
-        # Convert to boolean masks
-        detected = (detected.float() > 0.5).bool() # [N1, 1, H, W]
-        gt = (gt.float() > 0.5).bool().permute(1,0,2,3) # [1, N2, H, W]
-
-        intersection = torch.logical_and(detected, gt).float().sum((-2, -1))
-        instance_size = detected.float().sum((-2, -1))
-        
-        iou = (intersection + 1e-6) / (instance_size + 1e-6) # [N1, N2]
+        iou = self._calc_iou(detected, masks) # [N1, N2]
         thresholded = iou # When we add semantic label thresholding
-        row_idx, col_idx = linear_sum_assignment(-thresholded.cpu()) # Score -> cost
-        matched_idxes = torch.stack([torch.from_numpy(row_idx), torch.from_numpy(col_idx)], axis=1)
-        matched_score = iou[row_idx, col_idx]
-        matched_idxes = matched_idxes[torch.nonzero(matched_score>thresh).flatten()] # [N, 2] or [2]
-        # This happens when we only have one pair of masks matched
-        # It makes subsequent functions so we unsqueeze for an extra dimension
-        if len(matched_idxes.shape) == 1:
-            matched_idxes = matched_idxes[None, :]
+        max_ious, max_idxes = torch.max(thresholded, dim=1)
+        matched_idxes = []
+        for i, (max_iou, max_idx) in enumerate(zip(max_ious, max_idxes)):
+            if max_iou > thresh:
+                matched_idxes.append(torch.tensor([i, max_idx]))
+        # If nothing is matched, construct a dummy tensor
+        if len(matched_idxes) == 0:
+            matched_idxes = torch.full((0, 2), -1)
+        else:
+            matched_idxes = torch.stack(matched_idxes)
 
         return matched_idxes
 

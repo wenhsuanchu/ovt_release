@@ -9,6 +9,7 @@ from fvcore.transforms import HFlipTransform, NoOpTransform
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
+from detectron2.data import MetadataCatalog
 from detectron2.config import configurable
 from detectron2.data.detection_utils import read_image
 from detectron2.data.transforms import (
@@ -22,6 +23,30 @@ from detectron2.structures import Boxes, Instances
 from detectron2.modeling.meta_arch.rcnn import GeneralizedRCNN
 from detectron2.modeling.postprocessing import detector_postprocess
 from detectron2.modeling.roi_heads.fast_rcnn import fast_rcnn_inference_single_image
+
+from .modeling.utils import reset_cls_test
+
+BUILDIN_CLASSIFIER = {
+    'lvis': '/home/wenhsuac/ovt/Detic/datasets/metadata/lvis_v1_clip_a+cname.npy',
+    'objects365': '/home/wenhsuac/ovt/Detic/datasets/metadata/o365_clip_a+cnamefix.npy',
+    'openimages': '/home/wenhsuac/ovt/Detic/datasets/metadata/oid_clip_a+cname.npy',
+    'coco': '/home/wenhsuac/ovt/Detic/datasets/metadata/coco_clip_a+cname.npy',
+}
+
+BUILDIN_METADATA_PATH = {
+    'lvis': 'lvis_v1_val',
+    'objects365': 'objects365_v2_val',
+    'openimages': 'oid_val_expanded',
+    'coco': 'coco_2017_val',
+}
+
+def get_clip_embeddings(vocabulary, prompt='a '):
+    from detic.modeling.text.text_encoder import build_text_encoder
+    text_encoder = build_text_encoder(pretrain=True)
+    text_encoder.eval()
+    texts = [prompt + x for x in vocabulary]
+    emb = text_encoder(texts).detach().permute(1, 0).contiguous().cpu()
+    return emb
 
 class DatasetMapperTTA:
     """
@@ -128,6 +153,19 @@ class CustomRCNNWithTTA(nn.Module):
             tta_mapper = DatasetMapperTTA(cfg)
         self.tta_mapper = tta_mapper
         self.batch_size = batch_size
+
+        # TODO: Newly added for filtering
+        if cfg.vocabulary == 'custom':
+            self.metadata = MetadataCatalog.get("__unused")
+            self.metadata.thing_classes = cfg.custom_vocabulary.split(',')
+            classifier = get_clip_embeddings(self.metadata.thing_classes)
+        else:
+            self.metadata = MetadataCatalog.get(
+                BUILDIN_METADATA_PATH[cfg.vocabulary])
+            classifier = BUILDIN_CLASSIFIER[cfg.vocabulary]
+
+        num_classes = len(self.metadata.thing_classes)
+        reset_cls_test(self.model, classifier, num_classes)
 
     @contextmanager
     def _turn_off_roi_heads(self, attrs):

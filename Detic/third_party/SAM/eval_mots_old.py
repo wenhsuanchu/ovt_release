@@ -31,7 +31,7 @@ import detectron2.data.transforms as T
 from detectron2.structures import Instances, Boxes
 from detectron2.checkpoint import DetectionCheckpointer
 
-from dataset.uvo_dataset import UVOTestDataset
+from dataset.mots_dataset import MOTSDataset
 from utils.flow import run_flow_on_images
 from segment_anything import sam_model_registry, SamCustomPredictor
 from sam_propagator_uvo import Propagator
@@ -106,7 +106,7 @@ Arguments loading
 """
 parser = ArgumentParser()
 parser.add_argument('--model', default='saves/stcn.pth')
-parser.add_argument('--uvo_path', default='/projects/katefgroup/datasets/UVO/')
+parser.add_argument('--mots_path', default='/projects/katefgroup/datasets/MOTS/MOTS')
 parser.add_argument('--output')
 parser.add_argument('--load_backward', action='store_true')
 parser.add_argument('--split', help='val/testdev', default='val')
@@ -154,7 +154,7 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-uvo_path = args.uvo_path
+mots_path = args.mots_path
 out_path = args.output
 
 # Simple setup
@@ -200,7 +200,7 @@ sam = sam_model_registry[model_type](checkpoint=CKPT_PATH)
 sam.to(device=device)
 predictor = SamCustomPredictor(sam)
 
-test_dataset = UVOTestDataset(uvo_path, load_backward=args.load_backward)
+test_dataset = MOTSDataset(mots_path)
 test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2)
 
 total_process_time = 0
@@ -212,7 +212,6 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
     #if test_id > 5: break
 
     rgb = data['rgb'][0] # [B, S, H, W, C] -> [S, H, W, C]
-    msk = data['gt'][0].to(sam.device)
     info = data['info']
     name = info['name'][0]
     vid_id = info['id']
@@ -221,7 +220,7 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
     process_begin = time.time()
     print(name, size, rgb.shape)
 
-    if os.path.exists(path.join(out_path, "json", "{:04d}.json".format(vid_id.item()))):
+    if os.path.exists(path.join(out_path, "json", "{}.json".format(name))):
         continue
 
     detections = []
@@ -267,8 +266,6 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
         prob = F.interpolate(prob, size, mode='bilinear', align_corners=False)
 
         merged_labels = torch.zeros((1, *size), dtype=torch.uint8, device='cuda')
-        num_objects = msk.shape[1]
-        labels_in_gt = np.arange(1, num_objects+1)
 
         # Swap Re-ID labels, do this in a backwards manner as that's how things get linked
         for i, label in enumerate(reversed(processor.valid_instances[ti])):
@@ -323,31 +320,21 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
 
     # Generate output json
     # We will generate one json per video so we can parallelize
-    results = []
-    for inst_id in range(1, processor.total_instances):
-        instance_masks = []
-        for ti, out_mask in enumerate(out_masks):
-            if inst_id in processor.valid_instances[ti]:
-                mask_idx = processor.valid_instances[ti].tolist().index(inst_id)
-                seg = rle_encode(np.asfortranarray(out_mask[mask_idx][0].detach().cpu().numpy() > 0.5).astype(np.uint8))
-                seg['counts'] = seg['counts'].decode()
-                instance_masks.append(seg)
-            else:
-                instance_masks.append(None)
-        instance_dict = {
-            'video_id': vid_id.item(),
-            'score': 0.9, # We should replace this with detection scores at some point
-            'category_id': 1,
-            'segmentations': instance_masks
-        }
-        results.append(instance_dict)
-    #print(results)
-    results_json = json.dumps(results)
     if args.output:
         json_save_path = path.join(out_path, "json")
         os.makedirs(json_save_path, exist_ok=True)
-        with open(path.join(json_save_path, "{:04d}.json".format(vid_id.item())), 'w') as f:
-            f.write(results_json)
+        with open(path.join(json_save_path, "{}.json".format(name)), 'w') as f:
+            for ti, out_mask in enumerate(out_masks):
+                for inst_id in processor.valid_instances[ti]:
+                    if inst_id != -1:
+                        mask_idx = processor.valid_instances[ti].tolist().index(inst_id)
+                        seg = rle_encode(np.asfortranarray(out_mask[mask_idx][0].detach().cpu().numpy() > 0.5).astype(np.uint8))
+                        seg = seg['counts'].decode()
+                        cat_id = 1 # Placeholder for now
+                        height = info['size'][0]
+                        width = info['size'][1]
+                        out_str = f'{ti} {inst_id} {cat_id} {height} {width} {seg}'
+                        f.write(out_str + '\n')
 
     # Save the results
     if args.output:
@@ -365,10 +352,10 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
 
             img_E = img_E.convert('RGBA')
             #img_E.putalpha(127)
-            img_E = img_E.resize((info['size'][1].item()//2, info['size'][0].item()//2))
-            img_O = Image.fromarray(data['orig_rgb'][0][f].numpy().astype(np.uint8))
+            img_E = img_E.resize((info['size_480p'][1].item(), info['size_480p'][0].item()))
+            img_O = Image.fromarray(data['rgb'][0][f].numpy().astype(np.uint8))
             img_O.putalpha(127)
-            img_O = img_O.resize((info['size'][1].item()//2, info['size'][0].item()//2))
+            img_O = img_O.resize((info['size_480p'][1].item(), info['size_480p'][0].item()))
             img_O.paste(img_E, (0, 0), img_E)
 
             if f > 0:
@@ -379,7 +366,7 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
                         while(inst_id in processor.reid_instance_mappings.keys()):
                             inst_id = processor.reid_instance_mappings[inst_id]
                         if inst_id != -1:
-                            draw.rectangle((torch.div(box, 2, rounding_mode='trunc')).tolist(), outline=tuple(davis_palette[inst_id%255]), width=2)
+                            draw.rectangle(box.tolist(), outline=tuple(davis_palette[inst_id%255]), width=2)
                         '''if processor.valid_instances[f][obj_id].item() in processor.reid_instance_mappings:
                             color = processor.reid_instance_mappings[processor.valid_instances[f][obj_id].item()]
                         else:
@@ -423,7 +410,6 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
     del predictions
     del detections
     del processor
-    del msk
 
 print('Total processing time: ', total_process_time)
 print('Total processed frames: ', total_frames)

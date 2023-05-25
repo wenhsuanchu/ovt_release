@@ -12,13 +12,16 @@ from torch.utils.data import DataLoader
 from PIL import Image, ImageDraw
 from scipy.optimize import linear_sum_assignment
 import torch.multiprocessing
+import warnings
 
+warnings.filterwarnings("ignore")
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 from progressbar import progressbar
 
 sys.path.insert(0, '../../')
 sys.path.insert(0, '../CenterNet2/')
+sys.path.insert(0, '../GroundingDINO/')
 sys.path.insert(0, '../gmflow/')
 from gmflow.gmflow import GMFlow
 from centernet.config import add_centernet_config
@@ -28,13 +31,18 @@ from detectron2.config import get_cfg
 from detectron2.modeling import build_model, GeneralizedRCNNWithTTA
 from detic.custom_tta import CustomRCNNWithTTA
 import detectron2.data.transforms as T
+import groundingdino.datasets.transforms as GDT
 from detectron2.structures import Instances, Boxes
 from detectron2.checkpoint import DetectionCheckpointer
 
-from dataset.uvo_dataset import UVOTestDataset
+from groundingdino.util.inference import load_model, load_image, predict, annotate
+from torchvision.ops import box_convert
+
+from dataset.burst_dataset import BURSTTestDataset
+from dataset.davis_dataset import DAVISTestDataset
 from utils.flow import run_flow_on_images
 from segment_anything import sam_model_registry, SamCustomPredictor
-from sam_propagator_uvo import Propagator
+from sam_propagator_grounded import Propagator
 from ytvostools.mask import encode as rle_encode
 
 CKPT_PATH = "/home/wenhsuac/ovt/Detic/third_party/SAM/pretrained/sam_vit_h_4b8939.pth"
@@ -91,8 +99,8 @@ def mask2rgb(mask, palette, max_id):
             rgb[mask==i] = palette[i%255]
             alpha[mask==i] = 0
             '''elif i == 1:
-            rgb[mask==i] = np.array([255,0,212])
-            alpha[mask==i] = 200'''
+                rgb[mask==i] = np.array([255,0,212])
+                alpha[mask==i] = 200'''
         else:
             rgb[mask==i] = palette[i%255]
             alpha[mask==i] = 200
@@ -106,7 +114,7 @@ Arguments loading
 """
 parser = ArgumentParser()
 parser.add_argument('--model', default='saves/stcn.pth')
-parser.add_argument('--uvo_path', default='/projects/katefgroup/datasets/UVO/')
+parser.add_argument('--dataset_path', default='/projects/katefgroup/datasets/BURST/')
 parser.add_argument('--output')
 parser.add_argument('--load_backward', action='store_true')
 parser.add_argument('--split', help='val/testdev', default='val')
@@ -127,6 +135,11 @@ parser.add_argument(
 )
 parser.add_argument(
         "--custom_vocabulary",
+        default="",
+        help="",
+)
+parser.add_argument(
+        "--caption",
         default="",
         help="",
 )
@@ -154,8 +167,9 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-uvo_path = args.uvo_path
+dataset_path = args.dataset_path
 out_path = args.output
+caption = args.caption
 
 # Simple setup
 if args.output: os.makedirs(out_path, exist_ok=True)
@@ -183,6 +197,9 @@ checkpoint = torch.load('/home/wenhsuac/ovt/Detic/third_party/gmflow/pretrained/
 weights = checkpoint['model'] if 'model' in checkpoint else checkpoint
 flow_predictor.load_state_dict(weights)
 
+gdino = load_model("/home/wenhsuac/ovt/Detic/third_party/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+                   "/home/wenhsuac/ovt/Detic/third_party/GroundingDINO/weights/groundingdino_swint_ogc.pth")
+
 detector = build_model(cfg)
 detector.eval()
 
@@ -200,7 +217,8 @@ sam = sam_model_registry[model_type](checkpoint=CKPT_PATH)
 sam.to(device=device)
 predictor = SamCustomPredictor(sam)
 
-test_dataset = UVOTestDataset(uvo_path, load_backward=args.load_backward)
+#test_dataset = BURSTTestDataset(os.path.join(dataset_path, 'val', 'all_classes.json'), os.path.join(burst_path, 'frames'), annotated_only=False)
+test_dataset = DAVISTestDataset(dataset_path, resolution=(480,720), imset='2017/debug.txt')
 test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2)
 
 total_process_time = 0
@@ -209,55 +227,71 @@ total_frames = 0
 for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loader), redirect_stdout=True)):
 
     #torch.cuda.empty_cache()
-    #if test_id > 5: break
+    if test_id > 20: break
 
-    rgb = data['rgb'][0] # [B, S, H, W, C] -> [S, H, W, C]
+    '''rgb = data['rgb'][0] # [B, S, H, W, C] -> [S, H, W, C]
     msk = data['gt'][0].to(sam.device)
     info = data['info']
     name = info['name'][0]
     vid_id = info['id']
-    size = info['size']
+    size = info['size']'''
+    # DAVIS
+    rgb = data['rgb'][0] # [B, S, H, W, C] -> [S, H, W, C]
+    msk = data['gt'][0].to(sam.device)
+    info = data['info']
+    name = info['name'][0]
+    size = info['shape']
+    info['size'] = info['shape']
     #torch.cuda.synchronize()
     process_begin = time.time()
-    print(name, size, rgb.shape)
-
-    if os.path.exists(path.join(out_path, "json", "{:04d}.json".format(vid_id.item()))):
-        continue
+    #print(name, vid_id, size, rgb.shape)
 
     detections = []
     detection_labels = []
 
-    # Run the detector
-    for img in rgb:
-        img = img.numpy()
-        height, width = img.shape[:2]
-        image = det_aug.get_transform(img).apply_image(img)
-        image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
-        inputs = [{"image": image, "height": height, "width": width}]
+    # Run the detector for frame 0
+    img = rgb[0].numpy()
+    height, width = img.shape[:2]
+    gdino_transform = GDT.Compose(
+        [
+            GDT.RandomResize([800], max_size=1333),
+            GDT.ToTensor(),
+            GDT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    img_transformed, _ = gdino_transform(Image.fromarray(img), None)
 
-        with torch.no_grad():
-            predictions = tta_detector(inputs)[0]
-            if len(predictions["instances"].pred_masks) > 0:
-                unique_masks, mask_labels = get_unique_masks(predictions)
-            else:
-                unique_masks = torch.zeros((0, height, width), device=device)
-                mask_labels = []
-            detections.append(unique_masks.unsqueeze(0).unsqueeze(2)) # [N, H, W] -> [1, N, 1, H, W]
-            detection_labels.append(mask_labels)
-    
-    fwd_flow, bwd_flow = run_flow_on_images(flow_predictor, rgb)
-    fwd_flow = torch.from_numpy(fwd_flow)
-    bwd_flow = torch.from_numpy(bwd_flow)
+    with torch.no_grad():
+        boxes, logits, phrases = predict(
+            model=gdino,
+            image=img_transformed,
+            caption=caption,
+            box_threshold=0.35,
+            text_threshold=0.25
+        )
+
+        xyxy = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
+        xyxy[:, ::2] = xyxy[:, ::2] * img.shape[1]
+        xyxy[:, 1::2] = xyxy[:, 1::2] * img.shape[0]
+
+        predictor.set_image(img.astype(np.uint8))
+        transformed_boxes = predictor.transform.apply_boxes_torch(torch.from_numpy(xyxy).to(sam.device), img.shape[:2])
+
+        masks, _, _, _, _ = predictor.predict_torch(
+            point_coords=None,
+            point_labels=None,
+            boxes=transformed_boxes,
+            multimask_output=False,
+        )
+        first_detection = masks # [N, 1, H, W]
     
     #torch.cuda.empty_cache()
 
     # Run inference model
-    first_detection = detections[0][0]
     if first_detection.shape[0] > 0:
-        processor = Propagator(predictor, detector, rgb, 1, det_aug)
+        processor = Propagator(predictor, detector, gdino, flow_predictor, rgb, 1, det_aug, caption)
         with torch.no_grad():
-            boxes = processor.interact(first_detection, 0, rgb.shape[0],
-                                       fwd_flow, bwd_flow, detections)
+            boxes = processor.interact(first_detection, 0, rgb.shape[0])
 
     # Postprocess predicted masks
     merged_masks = torch.zeros((processor.t, 1, *size), dtype=torch.uint8, device='cuda')
@@ -267,8 +301,6 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
         prob = F.interpolate(prob, size, mode='bilinear', align_corners=False)
 
         merged_labels = torch.zeros((1, *size), dtype=torch.uint8, device='cuda')
-        num_objects = msk.shape[1]
-        labels_in_gt = np.arange(1, num_objects+1)
 
         # Swap Re-ID labels, do this in a backwards manner as that's how things get linked
         for i, label in enumerate(reversed(processor.valid_instances[ti])):
@@ -323,7 +355,7 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
 
     # Generate output json
     # We will generate one json per video so we can parallelize
-    results = []
+    '''results = []
     for inst_id in range(1, processor.total_instances):
         instance_masks = []
         for ti, out_mask in enumerate(out_masks):
@@ -347,7 +379,7 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
         json_save_path = path.join(out_path, "json")
         os.makedirs(json_save_path, exist_ok=True)
         with open(path.join(json_save_path, "{:04d}.json".format(vid_id.item())), 'w') as f:
-            f.write(results_json)
+            f.write(results_json)'''
 
     # Save the results
     if args.output:
@@ -362,15 +394,17 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
         for f in range(rgb.shape[0]):
             
             img_E = Image.fromarray(mask2rgb(merged_masks[f], davis_palette, torch.max(processor.valid_instances[f])).astype(np.uint8), mode='RGBA')
+            #img_E.save(os.path.join(this_out_path, '{:05d}.png'.format(f)))
 
             img_E = img_E.convert('RGBA')
             #img_E.putalpha(127)
-            img_E = img_E.resize((info['size'][1].item()//2, info['size'][0].item()//2))
-            img_O = Image.fromarray(data['orig_rgb'][0][f].numpy().astype(np.uint8))
+            img_E = img_E.resize((info['size'][1].item(), info['size'][0].item()))
+            img_O = Image.fromarray(rgb[f].numpy().astype(np.uint8))
             img_O.putalpha(127)
-            img_O = img_O.resize((info['size'][1].item()//2, info['size'][0].item()//2))
+            img_O = img_O.resize((info['size'][1].item(), info['size'][0].item()))
             img_O.paste(img_E, (0, 0), img_E)
 
+            vis_ids = []
             if f > 0:
                 if len(boxes[f-1]) > 0:
                     draw = ImageDraw.Draw(img_O)
@@ -379,12 +413,12 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
                         while(inst_id in processor.reid_instance_mappings.keys()):
                             inst_id = processor.reid_instance_mappings[inst_id]
                         if inst_id != -1:
-                            draw.rectangle((torch.div(box, 2, rounding_mode='trunc')).tolist(), outline=tuple(davis_palette[inst_id%255]), width=2)
-                        '''if processor.valid_instances[f][obj_id].item() in processor.reid_instance_mappings:
-                            color = processor.reid_instance_mappings[processor.valid_instances[f][obj_id].item()]
-                        else:
-                            color = processor.valid_instances[f][obj_id]
-                        draw.rectangle((torch.div(box, 2, rounding_mode='trunc')).tolist(), outline=tuple(davis_palette[color%255]), width=2)'''
+                            try:
+                                draw.rectangle(box.tolist(), outline=tuple(davis_palette[inst_id%255]), width=2)
+                            except ValueError:
+                                # Sometimes the box is invalid, just move along and hope for the best.
+                                print("Warning: Invalid box")
+                                pass
 
             gif_frames.append(img_O)
 
@@ -420,10 +454,8 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
         del gif_frames
 
     del rgb
-    del predictions
     del detections
     del processor
-    del msk
 
 print('Total processing time: ', total_process_time)
 print('Total processed frames: ', total_frames)

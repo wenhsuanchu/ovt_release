@@ -26,6 +26,7 @@ from detic.config import add_detic_config
 
 from detectron2.config import get_cfg
 from detectron2.modeling import build_model, GeneralizedRCNNWithTTA
+from detic.custom_tta import CustomRCNNWithTTA
 import detectron2.data.transforms as T
 from detectron2.structures import Instances, Boxes
 from detectron2.checkpoint import DetectionCheckpointer
@@ -56,6 +57,9 @@ def setup_cfg(args):
     cfg.TEST.AUG.FLIP = True
     cfg.TEST.AUG.MIN_SIZES = [int(cfg.INPUT.MIN_SIZE_TEST*0.75), cfg.INPUT.MIN_SIZE_TEST, int(cfg.INPUT.MIN_SIZE_TEST*1.25)]
     cfg.TEST.AUG.MAX_SIZE = cfg.INPUT.MAX_SIZE_TEST
+    cfg.vocabulary = args.vocabulary
+    if args.custom_vocabulary is not None:
+        cfg.custom_vocabulary = args.custom_vocabulary
     cfg.freeze()
     return cfg
 
@@ -135,8 +139,19 @@ def mask2rgb(mask, palette, max_id):
     H, W = mask.shape
     palette = torch.stack(palette).reshape((256, 3))
     rgb = np.zeros((H, W, 3))
+    alpha = np.zeros((H, W, 1))
     for i in range(max_id+1):
-        rgb[mask==i] = palette[i]
+        if i ==0:
+            rgb[mask==i] = palette[i]
+            alpha[mask==i] = 0
+            '''elif i == 1:
+                rgb[mask==i] = np.array([255,0,212])
+                alpha[mask==i] = 200'''
+        else:
+            rgb[mask==i] = palette[i]
+            alpha[mask==i] = 200
+    
+    rgb = np.concatenate([rgb, alpha], axis=-1)
 
     return rgb
 
@@ -164,9 +179,9 @@ parser.add_argument(
     help="",
 )
 parser.add_argument(
-        "--custom_vocabulary",
-        default="",
-        help="",
+    "--custom_vocabulary",
+    default=None,
+    help="",
 )
 parser.add_argument(
     "--confidence-threshold",
@@ -231,7 +246,8 @@ det_aug = T.ResizeShortestEdge(
     [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
 )
 
-tta_detector = GeneralizedRCNNWithTTA(cfg, detector)
+#tta_detector = GeneralizedRCNNWithTTA(cfg, detector)
+tta_detector = CustomRCNNWithTTA(cfg, detector)
 
 sam = sam_model_registry[model_type](checkpoint=CKPT_PATH)
 sam.to(device=device)
@@ -358,7 +374,7 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
         gif_frames = []
         for f in range(rgb.shape[0]):
             
-            img_E = Image.fromarray(mask2rgb(out_masks[f], info['palette'], torch.max(processor.valid_instances[f])).astype(np.uint8))
+            img_E = Image.fromarray(mask2rgb(out_masks[f], info['palette'], torch.max(processor.valid_instances[f])).astype(np.uint8), mode='RGBA')
             #img_E.save(os.path.join(this_out_path, '{:05d}.png'.format(f)))
             
             gt_with_bg = torch.cat([torch.ones_like(data['gt'][0][:1, f])*0.01, data['gt'][0][:, f]], dim=0)
@@ -367,11 +383,13 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
             img_GT.putpalette(info['palette'])
 
             img_E = img_E.convert('RGBA')
-            img_E.putalpha(127)
+            #img_E.putalpha(127)
             img_GT = img_GT.convert('RGBA')
             img_GT.putalpha(127)
 
             img_O = Image.fromarray(data['orig_rgb'][0][f].numpy().astype(np.uint8))
+            img_O = img_O.convert('RGBA')
+            img_O.putalpha(127)
             img_O = img_O.resize((size[1], size[0]))
             img_O2 = img_O.copy()
             img_O.paste(img_E, (0, 0), img_E)

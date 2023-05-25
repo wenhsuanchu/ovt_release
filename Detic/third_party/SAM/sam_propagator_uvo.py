@@ -147,7 +147,8 @@ class Propagator:
             # For now we'll just set all mask predictions to zero
             if len(boxes) == 0:
                 all_boxes.append(boxes)
-                out_masks = torch.zeros((0,)+self.prob[0].shape[1:])
+                out_masks = torch.zeros((0,)+self.prob[0].shape[1:], device=self.device)
+                embeddings = torch.zeros((0,)+prev_embeddings.shape[1:], device=self.device)
             else:
                 # Refine boxes using box regressor
                 boxes = torch.stack(boxes)
@@ -228,7 +229,7 @@ class Propagator:
             if len(valid_instances) > 0:
                 self.valid_instances[ti] = torch.stack(valid_instances)
             prev_embeddings = embeddings
-            #print("MERGED", ti, merged_mask.shape, self.valid_instances[ti])
+            #print("MERGED", ti, merged_mask.shape)
 
         return closest_ti, all_boxes
 
@@ -287,27 +288,27 @@ class Propagator:
 
         # Figure out how many instances there are in the two frames
         num_instances = propagation.shape[0] + detection.shape[0] - len(matched_idxes_low)
-        num_instances = max(num_instances, propagation.shape[0])
-        # If we don't have too many objects yet, then allow new tracklets to spawn
-        if num_instances < max_tracklets:
-
-            merged_mask = torch.zeros((num_instances,)+self.prob[0].shape[1:], device=self.prob[0].device)
-            # Handle instances from the first frame
-            for label_idx in range(propagation.shape[0]):
-                if label_idx in matched_idxes[:, 0]:
-                    # If high IOU, use detections
-                    detected_idx = matched_idxes[(matched_idxes[:, 0] == label_idx).nonzero().squeeze(1), 1]
-                    merged_mask[label_idx] = detection[detected_idx]
-                else:
-                    # Otherwise use propagation
-                    merged_mask[label_idx] = propagation[label_idx]
-            # Handle (new) instances detected in the second frame
-            # We match using lower thresholds to prevent over-initializing
-            curr_instance_idx = propagation.shape[0]
-            for label_idx in range(detection.shape[0]):
-                if label_idx not in matched_idxes_low[:, 0]:
-                    merged_mask[curr_instance_idx] = detection[label_idx]
-                    curr_instance_idx += 1
+        num_instances = min(num_instances, max_tracklets)
+        merged_mask = torch.zeros((num_instances,)+self.prob[0].shape[1:], device=self.prob[0].device)
+        # Handle (existing) instances from frame 1
+        curr_instance_count = propagation.shape[0]
+        for label_idx in range(propagation.shape[0]):
+            if label_idx in matched_idxes[:, 0]:
+                # If high IOU, use detections
+                detected_idx = matched_idxes[(matched_idxes[:, 0] == label_idx).nonzero().squeeze(1), 1]
+                merged_mask[label_idx] = detection[detected_idx]
+            else:
+                # Otherwise use propagation
+                merged_mask[label_idx] = propagation[label_idx]
+        # If we don't have too many objects yet, then allow new tracks to spawn
+        # This handles (new) instances detected in the second frame
+        for label_idx in range(detection.shape[0]):
+            # Check if the detection is "new"
+            if label_idx not in matched_idxes_low[:, 0]:
+                # Make sure we don't have too many tracks
+                if curr_instance_count < max_tracklets:
+                    merged_mask[curr_instance_count] = detection[label_idx]
+                    curr_instance_count += 1
                     valid_instances.append(torch.tensor(self.total_instances+1, device=self.device))
                     self.feat_hist.append(collections.deque(maxlen=10))
 
@@ -316,20 +317,9 @@ class Propagator:
                     self.new_instance_ids.append(self.total_instances+1)
 
                     self.total_instances += 1
-
-        # Otherwise we skip the parts that generate new tracklets
-        else:
-            merged_mask = torch.zeros_like(propagation)
-            num_instances = propagation.shape[0] # Adjust num_instances
-            # Handle instances from the first frame
-            for label_idx in range(propagation.shape[0]):
-                if label_idx in matched_idxes[:, 0]:
-                    # If high IOU, use detections
-                    detected_idx = matched_idxes[(matched_idxes[:, 0] == label_idx).nonzero().squeeze(1), 1]
-                    merged_mask[label_idx] = detection[detected_idx]
+                # Otherwise we are done
                 else:
-                    # Otherwise use propagation
-                    merged_mask[label_idx] = propagation[label_idx]
+                    break
         #print(ti, merged_mask.shape, out_labels.shape, detection.shape, len(matched_idxes_low))
 
         return merged_mask, valid_instances
@@ -448,7 +438,7 @@ class Propagator:
         row_idx, col_idx = linear_sum_assignment(-thresholded.cpu()) # Score -> cost
         matched_idxes = torch.stack([torch.from_numpy(row_idx), torch.from_numpy(col_idx)], axis=1)
         matched_score = iou[row_idx, col_idx]
-        matched_idxes = matched_idxes[torch.nonzero(matched_score>iou_thresh).flatten()] # [N, 2] or [2]
+        matched_idxes = matched_idxes[torch.nonzero(matched_score>iou_thresh).flatten().cpu()] # [N, 2] or [2]
         # This happens when we only have one pair of masks matched
         # It makes subsequent functions so we unsqueeze for an extra dimension
         if len(matched_idxes.shape) == 1:
