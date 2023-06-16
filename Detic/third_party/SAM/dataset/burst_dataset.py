@@ -3,6 +3,7 @@ from os import path
 import torch
 from torch.utils.data.dataset import Dataset
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 from PIL import Image
 import numpy as np
 
@@ -18,33 +19,35 @@ class BURSTTestDataset(Dataset):
         if load_backward:
             self.dataset._videos = list(reversed(self.dataset._videos))
 
+        self.img_transform = transforms.Resize(480, interpolation=InterpolationMode.BILINEAR, antialias=True)
+
     def __getitem__(self, idx):
         video = self.dataset[idx]
 
         info = {}
         info["id"] = video.id
+        info["dataset"] = video.dataset
         info["name"] = video.name
+        info["negative_category_ids"] = video.negative_category_ids
+        info["not_exhaustive_category_ids"] = video.not_exhaustive_category_ids
         info["size"] = video.image_size
+        info['all_frames'] = video.all_images_paths
+        info['required_frames'] = video.annotated_image_paths
 
         images = []
-        orig_images = []
-        paths = video.annotated_image_paths if self.annotated_only else video.all_images_paths[::10]
+        paths = video.annotated_image_paths if self.annotated_only else video.all_images_paths[::5]
+        info['processed_frames'] = paths
         for i, f in enumerate(paths):
             img = Image.open(path.join(video._images_dir, f)).convert("RGB")
-            orig_images.append(torch.from_numpy(np.array(img)))
+            img = np.array(self.img_transform(img))
+            if i == 0:
+                info['size_480p'] = img.shape[:2]
             images.append(np.array(img))
 
-        orig_images = torch.stack(orig_images, 0)
         images = np.stack(images, 0)
 
-        # No groundtruth masks provided for testing.
-        masks = torch.zeros(images.shape[0], 1, info["size"][0], info["size"][1])
-        masks = masks.unsqueeze(2)
-
         data = {
-            "orig_rgb": orig_images,
             "rgb": images,
-            "gt": masks,
             "info": info,
         }
 

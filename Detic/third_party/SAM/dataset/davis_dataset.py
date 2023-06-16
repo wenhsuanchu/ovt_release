@@ -16,11 +16,9 @@ from dataset.util import all_to_onehot
 
 
 class DAVISTestDataset(Dataset):
-    def __init__(self, root, imset='2017/val.txt', resolution=480, target_name=None, load_saved_detections=False):
+    def __init__(self, root, imset='2017/val.txt', resolution=480, target_name=None):
         self.root = root
         self.mask_dir = path.join(root, 'Annotations_480')
-        self.detection_dir = path.join(root, 'Detected_Annotations_NPZ_480')
-        self.flow_dir = path.join(root, 'Flow_480')
         self.image_dir = path.join(root, 'JPEGImages_480')
         self.resolution = resolution
         _imset_dir = path.join(root, 'ImageSets')
@@ -54,8 +52,6 @@ class DAVISTestDataset(Dataset):
                 _mask = np.array(_mask.convert("P", palette=Image.Palette.ADAPTIVE, colors=len(_mask.getcolors())))
                 self.num_objects[_video] = np.max(_mask)
 
-        self.load_saved_detections = load_saved_detections
-
     def __len__(self):
         return len(self.videos)
 
@@ -72,11 +68,7 @@ class DAVISTestDataset(Dataset):
         orig_images = []
         images = []
         masks = []
-        detections = []
-        detected_boxes = []
         scores = []
-        fwd_flows = []
-        bwd_flows = []
         for f in range(self.num_frames[video]):
             
             # Load RGBs
@@ -99,51 +91,9 @@ class DAVISTestDataset(Dataset):
                 # Test-set maybe?
                 masks.append(np.zeros_like(masks[0]))
 
-            # Load detections
-            if self.load_saved_detections:
-                detection_file = path.join(self.detection_dir, video, '{:05d}.npz'.format(f))
-                if path.exists(detection_file):
-                    detection_npz = np.load(detection_file)
-
-                    # Detectron should already sort based on confidence, but just in case
-                    score = torch.from_numpy(detection_npz['scores'])
-                    sorted_score, sort_idxes = torch.sort(score, descending=True)
-                    scores.append(sorted_score)
-
-                    detection = torch.from_numpy(detection_npz['mask']).unsqueeze(1).float() # [N, H, W] -> [N, 1, H, W]
-                    detection = torch.nn.functional.interpolate(detection, (info['shape'][0], info['shape'][1]), mode='nearest') # [N, 1, H, W]
-                    detection = (detection > 0.5).float()
-                    detections.append(detection[sort_idxes])
-
-                    boxes = masks_to_boxes(detection[sort_idxes].squeeze(1))
-                    detected_boxes.append(boxes)
-                else:
-                    print(f"Missing detection file at {detection_file}.")
-                    detections.append(torch.zeros_like(detections[0]))
-                    detected_boxes.append(torch.zeros_like(detected_boxes[0]))
-                    scores.append(torch.zeros_like(scores[0]))
-
-            # Load flow
-            fwd_flow_file = path.join(self.flow_dir, video, '{:05d}_fwd.flo'.format(f))
-            if path.exists(fwd_flow_file):
-                fwd_flow = self._readFlow(fwd_flow_file)
-                fwd_flows.append(fwd_flow)
-            else:
-                print(f"Missing flow file at {fwd_flow_file}.")
-                fwd_flows.append(np.zeros_like(fwd_flows[0]))
-            bwd_flow_file = path.join(self.flow_dir, video, '{:05d}_bwd.flo'.format(f))
-            if path.exists(bwd_flow_file):
-                bwd_flow = self._readFlow(bwd_flow_file)
-                bwd_flows.append(bwd_flow)
-            else:
-                print(f"Missing flow file at {bwd_flow_file}.")
-                bwd_flows.append(np.zeros_like(bwd_flows[0]))
-
         orig_images = torch.stack(orig_images, 0)
         images = np.stack(images, 0)
         masks = np.stack(masks, 0)
-        fwd_flows = np.stack(fwd_flows, 0)
-        bwd_flows = np.stack(bwd_flows, 0)
 
         # For masks, we need to convert to one hot labels
         gt_labels = np.unique(masks[0])
@@ -155,34 +105,9 @@ class DAVISTestDataset(Dataset):
         data = {
             'orig_rgb': orig_images,
             'rgb': images,
-            'fwd_flow': fwd_flows,
-            'bwd_flow': bwd_flows,
             'gt': masks,
-            'detections': detections,
-            'detected_boxes': detected_boxes,
             'scores': scores,
             'info': info,
         }
 
         return data
-
-    def _readFlow(self, filename):
-        """ Read .flo file in Middlebury format"""
-        # Code adapted from:
-        # http://stackoverflow.com/questions/28013200/reading-middlebury-flow-files-with-python-bytes-array-numpy
-
-        # WARNING: this will work on little-endian architectures (eg Intel x86) only!
-        # print 'fn = %s'%(fn)
-        with open(filename, 'rb') as f:
-            magic = np.fromfile(f, np.float32, count=1)
-            if 202021.25 != magic:
-                print('Magic number incorrect. Invalid .flo file')
-                return None
-            else:
-                w = np.fromfile(f, np.int32, count=1)
-                h = np.fromfile(f, np.int32, count=1)
-                # print 'Reading %d x %d flo file\n' % (w, h)
-                data = np.fromfile(f, np.float32, count=2 * int(w) * int(h))
-                # Reshape testdata into 3D array (columns, rows, bands)
-                # The reshape here is for visualization, the original code is (w,h,2)
-                return np.resize(data, (int(h), int(w), 2))

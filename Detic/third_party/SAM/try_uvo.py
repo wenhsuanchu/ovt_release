@@ -55,6 +55,15 @@ for idx in range(10):
     info['name'] = vid['ytid']
     info['size'] = (vid['height'], vid['width']) # Real sizes
 
+    print(len(anns), len(anns[0]['segmentations']))
+    decoded = rle_decode(anns[0]['segmentations'][:10]) > 0.5
+    print(decoded.shape)
+    reencoded = rle_encode(np.asfortranarray(decoded).astype(np.uint8))
+    print(len(reencoded))
+    redecoded = rle_decode(reencoded) > 0.5
+    print(redecoded.shape)
+    input()
+
     for i in range(len(anns)):
         inst_masks = []
         for j in range(len(anns[i]['segmentations'])):

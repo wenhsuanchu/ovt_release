@@ -43,15 +43,13 @@ class MOTSDataset(Dataset):
         images = []
         for i, f in enumerate(frames):
 
-            if i > 400: break
-
             img = Image.open(path.join(vid_im_dir, f)).convert('RGB')
             img = np.array(self.img_transform(img))
             if i == 0:
                 info['size_480p'] = img.shape[:2]
             images.append(img)
 
-        images = np.stack(images, 0)[::5]
+        images = np.stack(images, 0)
 
         data = {
             'rgb': images,

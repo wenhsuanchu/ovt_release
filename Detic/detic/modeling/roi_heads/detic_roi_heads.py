@@ -162,7 +162,7 @@ class DeticCascadeROIHeads(CascadeROIHeads):
                 predictor.test_nms_thresh,
                 predictor.test_topk_per_image,
             )
-            return pred_instances, boxes
+            return pred_instances, boxes, scores
 
 
     def forward(self, images, features, proposals, targets=None,
@@ -191,10 +191,10 @@ class DeticCascadeROIHeads(CascadeROIHeads):
                     device=proposals[0].objectness_logits.device))
             return proposals, losses
         else:
-            pred_instances, boxes = self._forward_box(
+            pred_instances, boxes, scores = self._forward_box(
                 features, proposals, classifier_info=classifier_info)
             pred_instances = self.forward_with_given_boxes(features, pred_instances)
-            return pred_instances, {"boxes": boxes}
+            return pred_instances, {"boxes": boxes, "scores": scores}
 
 
     def get_top_proposals(self, proposals):

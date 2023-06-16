@@ -12,27 +12,40 @@ from torch.utils.data import DataLoader
 from PIL import Image, ImageDraw
 from scipy.optimize import linear_sum_assignment
 import torch.multiprocessing
+import warnings
 
+warnings.filterwarnings("ignore")
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 from progressbar import progressbar
 
+sys.path.insert(0, '../../../dinov2')
 sys.path.insert(0, '../../')
 sys.path.insert(0, '../CenterNet2/')
+sys.path.insert(0, '../gmflow/')
+from gmflow.gmflow import GMFlow
 from centernet.config import add_centernet_config
 from detic.config import add_detic_config
 
 from detectron2.config import get_cfg
 from detectron2.modeling import build_model, GeneralizedRCNNWithTTA
+from detic.custom_tta import CustomRCNNWithTTA
 import detectron2.data.transforms as T
-from detectron2.structures import Instances, Boxes
 from detectron2.checkpoint import DetectionCheckpointer
 
+#from STCN.model.eval_network import STCN
+import hubconf
+
 from dataset.davis_dataset import DAVISTestDataset
+from dataset.davis_metrics import db_eval_boundary, db_eval_iou
 from segment_anything import sam_model_registry, SamCustomPredictor
-from sam_propagator import Propagator
+#from segment_anything_hq import sam_model_registry, SamCustomPredictor
+#from sam_propagator import Propagator
+from sam_propagator_local2 import Propagator
+from ytvostools.mask import decode as rle_decode
 
 CKPT_PATH = "/home/wenhsuac/ovt/Detic/third_party/SAM/pretrained/sam_vit_h_4b8939.pth"
+#CKPT_PATH = "/home/wenhsuac/ovt/Detic/third_party/SAM/pretrained/sam_hq_vit_h.pth"
 
 def setup_cfg(args):
     cfg = get_cfg()
@@ -52,6 +65,9 @@ def setup_cfg(args):
     cfg.TEST.AUG.FLIP = True
     cfg.TEST.AUG.MIN_SIZES = [int(cfg.INPUT.MIN_SIZE_TEST*0.75), cfg.INPUT.MIN_SIZE_TEST, int(cfg.INPUT.MIN_SIZE_TEST*1.25)]
     cfg.TEST.AUG.MAX_SIZE = cfg.INPUT.MAX_SIZE_TEST
+    # cfg.vocabulary = args.vocabulary
+    # if args.custom_vocabulary is not None:
+    #     cfg.custom_vocabulary = args.custom_vocabulary
     cfg.freeze()
     return cfg
 
@@ -135,7 +151,7 @@ def mask2rgb(mask, palette, max_id):
     palette = torch.stack(palette).reshape((256, 3))
     rgb = np.zeros((H, W, 3))
     for i in range(max_id+1):
-        rgb[mask==i] = palette[i]
+        rgb[mask==i] = palette[i%255]
 
     return rgb
 
@@ -161,6 +177,11 @@ parser.add_argument(
     default="lvis",
     choices=['lvis', 'openimages', 'objects365', 'coco', 'custom'],
     help="",
+)
+parser.add_argument(
+        "--custom_vocabulary",
+        default="",
+        help="",
 )
 parser.add_argument(
     "--confidence-threshold",
@@ -201,6 +222,22 @@ device = "cuda"
 
 cfg = setup_cfg(args)
 
+flow_predictor = GMFlow(feature_channels=128,
+                        num_scales=2,
+                        upsample_factor=4,
+                        num_head=1,
+                        attention_type='swin',
+                        ffn_dim_expansion=4,
+                        num_transformer_layers=6,
+                        ).to(device)
+flow_predictor.eval()
+
+#dino = hubconf.dinov2_vits14().cuda().eval()
+
+checkpoint = torch.load('/home/wenhsuac/ovt/Detic/third_party/gmflow/pretrained/gmflow_with_refine_sintel-3ed1cf48.pth')
+weights = checkpoint['model'] if 'model' in checkpoint else checkpoint
+flow_predictor.load_state_dict(weights)
+
 detector = build_model(cfg)
 detector.eval()
 
@@ -212,30 +249,27 @@ det_aug = T.ResizeShortestEdge(
 )
 
 tta_detector = GeneralizedRCNNWithTTA(cfg, detector)
+#tta_detector = CustomRCNNWithTTA(cfg, detector)
 
 sam = sam_model_registry[model_type](checkpoint=CKPT_PATH)
 sam.to(device=device)
 predictor = SamCustomPredictor(sam)
 
-test_dataset = DAVISTestDataset(davis_path, resolution=(480,720), imset='2017/debug.txt')
+test_dataset = DAVISTestDataset(davis_path, resolution=(480,720), imset='2017/val.txt')
 test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2)
 
 total_process_time = 0
 total_frames = 0
 mious = []
+j_metrics = np.array([])
+f_metrics = np.array([])
 
 for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout=True):
 
-    torch.cuda.empty_cache()
+    #torch.cuda.empty_cache()
 
     rgb = data['rgb'][0] # [B, S, H, W, C] -> [S, H, W, C]
-    fwd_flow = data['fwd_flow'][0] # [B, H, W, 2] -> [H, W, 2]
-    bwd_flow = data['bwd_flow'][0] # [B, H, W, 2] -> [H, W, 2]
-    #detections = data['detections']
-    #detected_boxes = data['detected_boxes'] # list([B, N, 4])
     msk = data['gt'][0].to(sam.device)
-    print(msk.shape)
-    assert(False)
     info = data['info']
     name = info['name'][0]
     k = msk.shape[0]
@@ -244,10 +278,31 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
     process_begin = time.time()
     print(name, rgb.shape)
 
-    detections = []
+    # Run the detector for frame 0
+    img = rgb[0].numpy()
+    height, width = img.shape[:2]
+    image = det_aug.get_transform(img).apply_image(img)
+    image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+    inputs = [{"image": image, "height": height, "width": width}]
+
+    with torch.no_grad():
+        predictions = tta_detector(inputs)[0]
+        if len(predictions["instances"].pred_masks) > 0:
+            unique_masks, mask_labels = get_unique_masks(predictions)
+        else:
+            unique_masks = torch.zeros((0, height, width), device=device)
+            mask_labels = []
+        first_detection = unique_masks.unsqueeze(1) # [N, H, W] -> [N, 1, H, W]
+        first_detection_labels = mask_labels
+
+    # Find corresponding mask for each annotation in GT
+    matched_idxes = find_matching_masks(msk[:, 0], first_detection, 0.0)
+    first_detection = first_detection[matched_idxes[:, 1]]
+    first_detection_labels = first_detection_labels[matched_idxes[:, 1]]
+
+    '''detections = []
     detection_labels = []
 
-    # Run the detector
     for img in rgb:
         img = img.numpy()
         height, width = img.shape[:2]
@@ -265,103 +320,95 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
             detections.append(unique_masks.unsqueeze(0).unsqueeze(2)) # [N, H, W] -> [1, N, 1, H, W]
             detection_labels.append(mask_labels)
     
-    torch.cuda.empty_cache()
+    torch.cuda.empty_cache()'''
 
-    matched_detections = []
-    # Find corresponding mask for frame 0 annotation in GT
+    # Find corresponding mask for each annotation in GT
+    '''matched_detections = []
     matched_idxes = find_matching_masks(msk[:, 0], detections[0][0], 0.0)
-    # Check if we actually matched something (sometimes there are no detections)
-    if len(matched_idxes) > 0:
-        # Index into the detections
-        matched_detection = detections[0][:, matched_idxes[:, 1]]
-        matched_labels = detection_labels[0][matched_idxes[:, 1]]
-    else:
-        # If nothing is matched, we just have no detections, so just append everything
-        matched_detections.append(detections[0]) # [1, 0, 1, H, W]
-        matched_labels = torch.tensor([], device=device)
-    # Store detections with the same class labels for the rest of the frames
+    matched_detections.append(detections[0][:, matched_idxes[:, 1]])
+    matched_labels = detection_labels[0][matched_idxes[:, 1]]
+
     for i, (det, labels) in enumerate(zip(detections, detection_labels)):
-        # Skip frame 0, we already have it
-        if i == 0: continue
-        # Get the matching detections based on labels
-        matched_idxes = []
-        for j in range(det.shape[1]):
-            if labels[j] in matched_labels:
-                matched_idxes.append(j)
-        matched_detection = detections[i][:, matched_idxes]
+        # Skip if first frame since we already have it
+        if i > 0:
+            # Get the matching detections based on labels
+            matched_idxes = []
+            for j in range(det.shape[1]):
+                if labels[j] in matched_labels:
+                    matched_idxes.append(j)
+            matched_detection = detections[i][:, matched_idxes]
+            matched_detections.append(matched_detection)
+
+    first_detection = matched_detections[0][0]'''
+    '''matched_detections = []
+    for i, det in enumerate(detections):
+        #print(i)
+        matched_idxes = find_matching_masks(msk[:, i], detections[i][0], 0.0 if i == 0 else 0.75)
+        matched_detection = detections[i][:, matched_idxes[:, 1]]
+        if i == 0:
+            matched_labels = detection_labels[i][matched_idxes[:, 1]]
         matched_detections.append(matched_detection)
 
+    first_detection = matched_detections[0][0]'''
     # Run inference model
-    first_detection = matched_detections[0][0]
     if first_detection.shape[0] > 0:
-        processor = Propagator(predictor, detector, rgb, k, det_aug)
+        processor = Propagator(predictor, detector, flow_predictor, dino, rgb, det_aug)
         with torch.no_grad():
-            boxes = processor.interact(first_detection, 0, rgb.shape[0],
-                                       fwd_flow, bwd_flow, matched_detections)
+            boxes = processor.interact(first_detection, first_detection_labels, 0, rgb.shape[0])
 
     # Postprocess predicted masks
-    merged_masks = torch.zeros((processor.t, 1, *size), dtype=torch.uint8, device='cuda')
-    out_masks = []
+    out_masks = torch.zeros((processor.t, *size), dtype=torch.uint8)
     for ti in range(processor.t):
-        prob = processor.prob[ti].float()
+        if len(processor.prob[ti]) > 0:
+            prob = torch.from_numpy(rle_decode(processor.prob[ti])).float().permute(2,0,1).unsqueeze(1) # [H, W, N] -> [N, 1, H, W]
+        else:
+            prob = torch.zeros((1, 1, *size))
         prob = F.interpolate(prob, size, mode='bilinear', align_corners=False)
-
-        merged_labels = torch.zeros((1, *size), dtype=torch.uint8, device='cuda')
-        num_objects = msk.shape[1]
-        labels_in_gt = np.arange(1, num_objects+1)
-
-        # Swap Re-ID labels, do this in a backwards manner as that's how things get linked
-        for i, label in enumerate(reversed(processor.valid_instances[ti])):
-            if label.item() in processor.reid_instance_mappings.keys():
-                new = label
-                new_prob_id = processor.valid_instances[ti].index(new)
-                old = processor.reid_instance_mappings[new.item()]
-                # If both old and new are valid, we need to merge labels
-                if torch.tensor(old, device='cuda') in processor.valid_instances[ti]:
-                    old_prob_id = processor.valid_instances[ti].index(torch.tensor(old, device='cuda'))
-                    # Hack: if both ids are in GT, we probably made a mistake, so skip it
-                    if new.item() in labels_in_gt and old in labels_in_gt:
-                        continue
-                    # This mapping goes both ways, we need to reverse the mapping if needed so the GT labels don't get replaced
-                    if new.item() in labels_in_gt:
-                        prob[new_prob_id] = torch.clamp(prob[new_prob_id] + prob[old_prob_id], max=1.0)
-                    elif old in labels_in_gt:
-                        prob[old_prob_id] = torch.clamp(prob[new_prob_id] + prob[old_prob_id], max=1.0)
-                # Otherwise we can just replace labels by replacing entries in valid_instances
-                else:
-                    # Keep replacing until we hit a GT label
-                    while(processor.valid_instances[ti][new_prob_id].item() in processor.reid_instance_mappings.keys()):
-                        new = processor.valid_instances[ti][new_prob_id]
-                        old = processor.reid_instance_mappings[new.item()]
-                        # Make sure we're not replacing GT labels
-                        if new.item() not in labels_in_gt:
-                            processor.valid_instances[ti][new_prob_id] = torch.tensor(old, device='cuda')
-                        else:
-                            break
-
-        # Merge instance masks
-        for prob_id, label in enumerate(processor.valid_instances[ti]):
-            if label.item() in labels_in_gt:
-                mask = prob[prob_id] > 0.5
-                merged_labels = mask * (mask * label) + (~mask) * merged_labels
+        num_instances = prob.shape[0]
+        
+        bg_mask = torch.ones((1,)+prob.shape[1:]) * 0.01
+        prob = torch.cat([bg_mask, prob], dim=0)
+        out_labels = torch.argmax(prob, dim=0)
+        replaced_labels = out_labels.clone()
+        #print("UNIQ1", ti, torch.unique(out_labels))
+        for idx in range(num_instances):
+            #print("REPLACING ", idx+1, "WITH", processor.valid_instances[ti][idx])
+            replaced_labels[out_labels==idx+1] = processor.valid_instances[ti][idx]
+        
+        for i, (new, old) in enumerate(reversed(processor.reid_instance_mappings.items())):
+            replaced_labels[replaced_labels==new] = old
  
-        merged_masks[ti] = merged_labels
-        out_masks.append(prob)
+        out_masks[ti] = replaced_labels[0]
     
-    merged_masks = (merged_masks.detach().cpu().numpy()[:,0]).astype(np.uint8)
+    out_masks = out_masks.numpy().astype(np.uint8)
 
-    torch.cuda.synchronize()
+    #torch.cuda.synchronize()
     total_process_time += time.time() - process_begin
     total_frames += rgb.shape[0]
+
     # Calc stats
-    out_labels = np.unique(merged_masks[0])
+    out_labels = np.unique(out_masks[0])
     out_labels = out_labels[out_labels!=0]
-    one_hot_detected = torch.from_numpy(all_to_onehot(merged_masks, out_labels)).float().unsqueeze(2)
+    one_hot_detected = torch.from_numpy(all_to_onehot(out_masks, out_labels)).float().unsqueeze(2)
+    if one_hot_detected.shape[0] < msk.shape[0]:
+        zero_padding = torch.zeros((msk.shape[0] - one_hot_detected.shape[0], *one_hot_detected.shape[1:]))
+        one_hot_detected = torch.cat([one_hot_detected, zero_padding], axis=0)
     matched_idxes = find_matching_masks(msk[:, 0], one_hot_detected[:, 0])
-    if len(matched_idxes) > 0:
+    '''if len(matched_idxes) > 0:
         for ti in range(1, rgb.shape[0]):
             miou = calc_iou(one_hot_detected[matched_idxes[:, 1], ti], msk[matched_idxes[:, 0], ti].cpu())
-            mious.append(miou.sum()/msk.shape[0])
+            mious.append(miou.sum()/msk.shape[0])'''
+    # Need NSHW
+    all_gt_masks = msk.cpu().numpy().squeeze(2) # [N, S, 1, H, W] -> [N, S, H, W]
+    all_res_masks = one_hot_detected[matched_idxes[:, 1]].cpu().numpy().squeeze(2)
+    if all_res_masks.shape[0] < all_gt_masks.shape[0]:
+        print("SHAPE MISMATCH")
+    j_metrics_res, f_metrics_res = np.zeros(all_gt_masks.shape[:2]), np.zeros(all_gt_masks.shape[:2])
+    for ii in range(all_gt_masks.shape[0]):
+        j_metrics_res[ii, :] = db_eval_iou(all_gt_masks[ii, ...], all_res_masks[ii, ...])
+        f_metrics_res[ii, :] = db_eval_boundary(all_gt_masks[ii, ...], all_res_masks[ii, ...])
+    j_metrics = np.append(j_metrics, j_metrics_res.flatten())
+    f_metrics = np.append(f_metrics, f_metrics_res.flatten())
 
     # Save the results
     if args.output:
@@ -374,7 +421,7 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
         gif_frames = []
         for f in range(rgb.shape[0]):
             
-            img_E = Image.fromarray(mask2rgb(merged_masks[f], info['palette'], torch.max(processor.valid_instances[f])).astype(np.uint8))
+            img_E = Image.fromarray(mask2rgb(out_masks[f], info['palette'], torch.max(processor.valid_instances[f])).astype(np.uint8))
             #img_E.save(os.path.join(this_out_path, '{:05d}.png'.format(f)))
             
             gt_with_bg = torch.cat([torch.ones_like(data['gt'][0][:1, f])*0.01, data['gt'][0][:, f]], dim=0)
@@ -394,12 +441,27 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
             img_O2.paste(img_GT, (0, 0), img_GT)
             #img_O.save(os.path.join(this_out_path2, '{:05d}.png'.format(f)))
 
-            if f+1 < rgb.shape[0]:
+            if f > 0:
+                if len(boxes[f-1]) > 0:
+                    draw = ImageDraw.Draw(img_O)
+                    for obj_id, box in reversed(list(enumerate(boxes[f-1]))):
+                        inst_id = processor.valid_instances[f][obj_id].item()
+                        while(inst_id in processor.reid_instance_mappings.keys()):
+                            inst_id = processor.reid_instance_mappings[inst_id]
+                        if inst_id != -1:
+                            try:
+                                draw.rectangle(box.tolist(), outline=tuple(davis_palette[inst_id%255]), width=2)
+                            except ValueError:
+                                # Sometimes the box is invalid, just move along and hope for the best.
+                                print("Warning: Invalid box")
+                                pass
+
+            '''if f+1 < rgb.shape[0]:
                 #print(name, processor.valid_instances[f+1], type(processor.valid_instances[f+1]))
                 img_prompt = Image.fromarray(data['orig_rgb'][0][f+1].numpy().astype(np.uint8))
                 img_prompt = img_prompt.resize((size[1], size[0]))
                 img_E_next = img_prompt.copy()
-                img_E_next = Image.fromarray(mask2rgb(merged_masks[f+1], info['palette'], torch.max(processor.valid_instances[f+1])).astype(np.uint8))
+                img_E_next = Image.fromarray(mask2rgb(out_masks[f+1], info['palette'], torch.max(processor.valid_instances[f+1])).astype(np.uint8))
                 img_E_next = img_E_next.convert('RGBA')
                 img_E_next.putalpha(127)
                 img_O_next = Image.fromarray(data['orig_rgb'][0][f+1].numpy().astype(np.uint8))
@@ -417,7 +479,7 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
                 merged_prompt.paste(img_O, (0, 0))
                 merged_prompt.paste(img_prompt, (img_O.width, 0))
                 merged_prompt.paste(img_O_next, (img_O.width+img_prompt.width, 0))
-                #merged_prompt.save(os.path.join(this_out_path3, '{:05d}.png'.format(f)))
+                #merged_prompt.save(os.path.join(this_out_path3, '{:05d}.png'.format(f)))'''
 
             merged = Image.new('RGB', (img_O.width + img_O2.width, img_O.height))
             merged.paste(img_O, (0, 0))
@@ -431,11 +493,10 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
 
     del rgb
     del predictions
-    del detections
-    del processor
     del msk
 
 print('Total processing time: ', total_process_time)
 print('Total processed frames: ', total_frames)
 print('FPS: ', total_frames / total_process_time)
-print('mIOU: ', torch.stack(mious).mean())
+#print('mIOU: ', torch.stack(mious).mean())
+print(np.mean(j_metrics), np.mean(f_metrics))

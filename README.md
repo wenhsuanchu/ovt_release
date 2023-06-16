@@ -31,7 +31,7 @@ pip install opencv-python pycocotools matplotlib onnxruntime onnx
 # install GMFlow requirements
 ```
 cd Detic/third_party/gmflow
-conda env update --file local.yml
+conda env update --name ovt --file environment.yml
 ```
 
 # download weights

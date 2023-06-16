@@ -3,7 +3,9 @@ import torch
 import torch.nn.functional as F
 import time
 import os
+import statistics
 import sys
+import json
 from os import path
 import argparse
 from argparse import ArgumentParser
@@ -25,24 +27,18 @@ from centernet.config import add_centernet_config
 from detic.config import add_detic_config
 
 from detectron2.config import get_cfg
-from detectron2.modeling import build_model
+from detectron2.modeling import build_model, GeneralizedRCNNWithTTA
 from detic.custom_tta import CustomRCNNWithTTA
 import detectron2.data.transforms as T
 from detectron2.checkpoint import DetectionCheckpointer
 
-from dataset.mots_dataset import MOTSDataset
+from dataset.ytvis_dataset import YTVISTestDataset
 from segment_anything import sam_model_registry, SamCustomPredictor
 from sam_propagator_local import Propagator
 from ytvostools.mask import encode as rle_encode
 from ytvostools.mask import decode as rle_decode
 
 CKPT_PATH = "/home/wenhsuac/ovt/Detic/third_party/SAM/pretrained/sam_vit_h_4b8939.pth"
-
-CATEGORY_LUT = {
-    0: 2, # person should be 2
-    1: 1, # car should be 1
-    2: 1 # automobile should be 1
-}
 
 def setup_cfg(args):
     cfg = get_cfg()
@@ -132,7 +128,7 @@ Arguments loading
 """
 parser = ArgumentParser()
 parser.add_argument('--model', default='saves/stcn.pth')
-parser.add_argument('--mots_path', default='/projects/katefgroup/datasets/MOTS/MOTS')
+parser.add_argument('--ytvis_path', default='/projects/katefgroup/datasets/OVT-Youtube/')
 parser.add_argument('--output')
 parser.add_argument('--load_backward', action='store_true')
 parser.add_argument('--split', help='val/testdev', default='val')
@@ -180,7 +176,7 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-mots_path = args.mots_path
+ytvis_path = args.ytvis_path
 out_path = args.output
 
 # Simple setup
@@ -226,7 +222,7 @@ sam = sam_model_registry[model_type](checkpoint=CKPT_PATH)
 sam.to(device=device)
 predictor = SamCustomPredictor(sam)
 
-test_dataset = MOTSDataset(mots_path)
+test_dataset = YTVISTestDataset(ytvis_path, load_backward=args.load_backward)
 test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2)
 
 total_process_time = 0
@@ -242,38 +238,40 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
     name = info['name'][0]
     vid_id = info['id']
     size = info['size']
-    #size = info['size_480p'] # HACK for vis only!
     #torch.cuda.synchronize()
     process_begin = time.time()
     print(name, size, rgb.shape)
 
-    #if os.path.exists(path.join(out_path, "json", "{}.json".format(name))):
+    #if os.path.exists(path.join(out_path, "json", "{:04d}.json".format(vid_id.item()))):
     #    continue
 
-    # Run the detector for frame 0
-    img = rgb[0].numpy()
-    height, width = img.shape[:2]
-    image = det_aug.get_transform(img).apply_image(img)
-    image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
-    inputs = [{"image": image, "height": height, "width": width}]
+    # Run the detector until we get some detection
+    first_detection = []
+    start_frame = -1
+    while len(first_detection) == 0 and (start_frame+1) < rgb.shape[0]:
+        start_frame += 1
+        img = rgb[start_frame].numpy()
+        height, width = img.shape[:2]
+        image = det_aug.get_transform(img).apply_image(img)
+        image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+        inputs = [{"image": image, "height": height, "width": width}]
 
-    with torch.no_grad():
-        predictions = tta_detector(inputs)[0]
-        if len(predictions["instances"].pred_masks) > 0:
-            unique_masks, mask_labels = get_unique_masks(predictions)
-        else:
-            unique_masks = torch.zeros((0, height, width), device=device)
-            mask_labels = []
-        first_detection = unique_masks.unsqueeze(1) # [N, H, W] -> [N, 1, H, W]
+        with torch.no_grad():
+            predictions = tta_detector(inputs)[0]
+            if len(predictions["instances"].pred_masks) > 0:
+                unique_masks, mask_labels = get_unique_masks(predictions)
+            else:
+                unique_masks = torch.zeros((0, height, width), device=device)
+                mask_labels = []
+            first_detection = unique_masks.unsqueeze(1) # [N, H, W] -> [N, 1, H, W]
 
     # Run inference model
-    processor = Propagator(predictor, detector, flow_predictor, rgb, det_aug)
+    processor = Propagator(predictor, detector, flow_predictor, rgb, det_aug, filter_labels=False)
     if first_detection.shape[0] > 0:
         with torch.no_grad():
-            boxes = processor.interact(first_detection, mask_labels, 0, rgb.shape[0])
+            print("Starting at frame", start_frame)
+            boxes = processor.interact(first_detection, mask_labels, start_frame, rgb.shape[0])
 
-    #torch.cuda.empty_cache()
-        
     # Postprocess predicted masks
     gif_frames = []
     for ti in range(processor.t):
@@ -314,23 +312,11 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
                 merged_masks = mask * (mask * label.item()) + (~mask) * merged_masks
         merged_masks = merged_masks[0] # [1, H, W] -> [H, W]
 
-        # Recompress masks after re-iding
-        # MOTS doesn't take overlapping masks so we use merged_masks instead of raw probs
-        nonoverlapping_prob = torch.zeros_like(prob)
-        for i, inst_id in enumerate(processor.valid_instances[ti]):
-            if inst_id != -1:
-                # It's possible that after the merging the mask has 0 size
-                # So set to invalid if that happens
-                if torch.sum(merged_masks == inst_id.item()) == 0:
-                    processor.valid_instances[ti][i] = -1
-                nonoverlapping_prob[i, 0] = (merged_masks == inst_id.item())
-        nonoverlapping_prob = nonoverlapping_prob.squeeze(1).permute(1,2,0) # [N, 1, H, W] -> [H, W, N]
-        processor.prob[ti] = rle_encode(np.asfortranarray(nonoverlapping_prob.numpy()).astype(np.uint8))
-        #prob = prob.squeeze(1).permute(1,2,0) # [N, 1, H, W] -> [H, W, N]
-        #processor.prob[ti] = rle_encode(np.asfortranarray(prob.numpy()).astype(np.uint8))
-
+        prob = prob.squeeze(1).permute(1,2,0) # [N, 1, H, W] -> [H, W, N]
+        processor.prob[ti] = rle_encode(np.asfortranarray(prob.numpy()).astype(np.uint8))
+    
         merged_masks = merged_masks.numpy()
-        
+
         # Generate gif frames if needed
         if args.output:
             img_O = visualize_frame(data['rgb'][0][ti],
@@ -340,7 +326,7 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
                                     info['size_480p'][0].item(),
                                     info['size_480p'][1].item(),
                                     davis_palette,
-                                    boxes[ti-1] if ti > 0 else list())
+                                    boxes[ti-(start_frame+1)] if ti > start_frame else list())
             gif_frames.append(img_O)
 
     #torch.cuda.synchronize()
@@ -351,25 +337,41 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
     if args.output:
 
         vis_save_path = path.join(out_path, "vis")
-        txt_save_path = path.join(out_path, "txt")
+        json_save_path = path.join(out_path, "json")
         os.makedirs(vis_save_path, exist_ok=True)
-        os.makedirs(txt_save_path, exist_ok=True)
+        os.makedirs(json_save_path, exist_ok=True)
 
-        # Generate output txt
-        # We will generate one txt per video so we can parallelize
-        with open(path.join(txt_save_path, "{}.txt".format(name)), 'w') as f:
+        # Generate output json
+        # We will generate one json per video so we can parallelize
+        results = []
+        for inst_id in range(1, processor.total_instances):
+            instance_masks = []
+            is_valid = False
+            cat_id = []
             for ti in range(processor.t):
-                for inst_id in processor.valid_instances[ti]:
-                    if inst_id != -1:
+                # Only add segmentations for the required frames
+                if info['all_frames'][ti] in info['required_frames']:
+                    if inst_id in processor.valid_instances[ti]:
                         mask_idx = processor.valid_instances[ti].tolist().index(inst_id)
+                        cat_id.append(processor.valid_labels[ti][mask_idx].item() + 1) # Shift category ID so it starts from 1 instead of 0
                         seg = processor.prob[ti][mask_idx]
-                        seg = seg['counts'].decode()
-                        raw_cat_id = processor.valid_labels[ti][mask_idx].item()
-                        cat_id = CATEGORY_LUT[raw_cat_id] if raw_cat_id in CATEGORY_LUT.keys() else 2 # default to person category
-                        height = info['size'][0].item()
-                        width = info['size'][1].item()
-                        out_str = f'{ti+1} {inst_id} {cat_id} {height} {width} {seg}'
-                        f.write(out_str + '\n')
+                        seg['counts'] = seg['counts'].decode()
+                        instance_masks.append(seg)
+                        is_valid = True
+                    else:
+                        instance_masks.append(None)
+            if is_valid:
+                instance_dict = {
+                    'video_id': vid_id.item(),
+                    'score': 0.9, # We should replace this with detection scores at some point
+                    'category_id': statistics.mode(cat_id), # Vote for the category ID
+                    'segmentations': instance_masks
+                }
+                results.append(instance_dict)
+
+        results_json = json.dumps(results)
+        with open(path.join(json_save_path, "{:04d}.json".format(vid_id.item())), 'w') as f:
+            f.write(results_json)
 
         # Save gif
         gif_save_path = os.path.join(vis_save_path, name+".gif")
