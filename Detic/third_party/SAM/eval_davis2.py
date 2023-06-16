@@ -352,7 +352,7 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
     first_detection = matched_detections[0][0]'''
     # Run inference model
     if first_detection.shape[0] > 0:
-        processor = Propagator(predictor, detector, flow_predictor, dino, rgb, det_aug)
+        processor = Propagator(predictor, detector, flow_predictor, None, rgb, det_aug)
         with torch.no_grad():
             boxes = processor.interact(first_detection, first_detection_labels, 0, rgb.shape[0])
 
