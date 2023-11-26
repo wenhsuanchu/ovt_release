@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import time
 import os
+import statistics
 import sys
 import json
 from os import path
@@ -10,14 +11,18 @@ import argparse
 from argparse import ArgumentParser
 from torch.utils.data import DataLoader
 from PIL import Image, ImageDraw
-from scipy.optimize import linear_sum_assignment
 import torch.multiprocessing
+import warnings
 
+warnings.filterwarnings("ignore")
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 from progressbar import progressbar
 
+sys.path.insert(0, '../../../dinov2')
+sys.path.insert(0, '../')
 sys.path.insert(0, '../../')
+sys.path.insert(0, '../../../')
 sys.path.insert(0, '../CenterNet2/')
 sys.path.insert(0, '../gmflow/')
 from gmflow.gmflow import GMFlow
@@ -28,14 +33,17 @@ from detectron2.config import get_cfg
 from detectron2.modeling import build_model, GeneralizedRCNNWithTTA
 from detic.custom_tta import CustomRCNNWithTTA
 import detectron2.data.transforms as T
-from detectron2.structures import Instances, Boxes
 from detectron2.checkpoint import DetectionCheckpointer
 
+from STCN.model.eval_network import STCN
+import hubconf
+from reid_net.model.model_base import ModelBase as ReIDNet
+
 from dataset.uvo_dataset import UVOTestDataset
-from utils.flow import run_flow_on_images
 from segment_anything import sam_model_registry, SamCustomPredictor
-from sam_propagator_uvo import Propagator
+from sam_propagator_local2_detic2 import Propagator
 from ytvostools.mask import encode as rle_encode
+from ytvostools.mask import decode as rle_decode
 
 CKPT_PATH = "/home/wenhsuac/ovt/Detic/third_party/SAM/pretrained/sam_vit_h_4b8939.pth"
 
@@ -100,6 +108,27 @@ def mask2rgb(mask, palette, max_id):
     rgb = np.concatenate([rgb, alpha], axis=-1)
 
     return rgb
+
+def visualize_frame(rgb, merged_masks, valid_instances, reid_mappings, height, width, palette, boxes=[]):
+        
+    img_E = Image.fromarray(mask2rgb(merged_masks, palette, torch.max(valid_instances)).astype(np.uint8), mode='RGBA')
+    img_E = img_E.convert('RGBA')
+    img_E = img_E.resize((width, height))
+    img_O = Image.fromarray(rgb.numpy().astype(np.uint8))
+    img_O.putalpha(127)
+    img_O = img_O.resize((width, height))
+    img_O.paste(img_E, (0, 0), img_E)
+
+    if len(boxes) > 0:
+        draw = ImageDraw.Draw(img_O)
+        for obj_id, box in reversed(list(enumerate(boxes))):
+            inst_id = valid_instances[obj_id].item()
+            while(inst_id in reid_mappings.keys()):
+                inst_id = reid_mappings[inst_id]
+            if inst_id != -1:
+                draw.rectangle(box.tolist(), outline=tuple(palette[inst_id%255]), width=2)
+    
+    return img_O
 
 """
 Arguments loading
@@ -179,6 +208,21 @@ flow_predictor = GMFlow(feature_channels=128,
                         ).to(device)
 flow_predictor.eval()
 
+#reid_net = hubconf.dinov2_vits14().cuda().eval()
+#reid_net = STCN().cuda().eval()
+reid_net = ReIDNet(9, '/home/wenhsuac/ovt/reid_net/pretrained/swin_tiny_pretrained.pth').cuda()
+ckpt = torch.load('/home/wenhsuac/ovt/reid_net/ckpts/finetune/iter_030000.pth')
+reid_net.load_state_dict(ckpt['model'])
+
+#Performs input mapping such that stage 0 model can be loaded
+# prop_saved = torch.load('/home/wenhsuac/ovt/Detic/third_party/STCN/saves/stcn.pth')
+# for k in list(prop_saved.keys()):
+#     if k == 'value_encoder.conv1.weight':
+#         if prop_saved[k].shape[1] == 4:
+#             pads = torch.zeros((64,1,7,7), device=prop_saved[k].device)
+#             prop_saved[k] = torch.cat([prop_saved[k], pads], 1)
+# reid_net.load_state_dict(prop_saved)
+
 checkpoint = torch.load('/home/wenhsuac/ovt/Detic/third_party/gmflow/pretrained/gmflow_with_refine_sintel-3ed1cf48.pth')
 weights = checkpoint['model'] if 'model' in checkpoint else checkpoint
 flow_predictor.load_state_dict(weights)
@@ -209,10 +253,9 @@ total_frames = 0
 for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loader), redirect_stdout=True)):
 
     #torch.cuda.empty_cache()
-    #if test_id > 5: break
+    #if test_id > 3: break
 
     rgb = data['rgb'][0] # [B, S, H, W, C] -> [S, H, W, C]
-    msk = data['gt'][0].to(sam.device)
     info = data['info']
     name = info['name'][0]
     vid_id = info['id']
@@ -224,12 +267,12 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
     if os.path.exists(path.join(out_path, "json", "{:04d}.json".format(vid_id.item()))):
         continue
 
-    detections = []
-    detection_labels = []
-
-    # Run the detector
-    for img in rgb:
-        img = img.numpy()
+    # Run the detector until we get some detection
+    first_detection = []
+    start_frame = -1
+    while len(first_detection) == 0 and (start_frame+1) < rgb.shape[0]:
+        start_frame += 1
+        img = rgb[start_frame].numpy()
         height, width = img.shape[:2]
         image = det_aug.get_transform(img).apply_image(img)
         image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
@@ -242,33 +285,24 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
             else:
                 unique_masks = torch.zeros((0, height, width), device=device)
                 mask_labels = []
-            detections.append(unique_masks.unsqueeze(0).unsqueeze(2)) # [N, H, W] -> [1, N, 1, H, W]
-            detection_labels.append(mask_labels)
-    
-    fwd_flow, bwd_flow = run_flow_on_images(flow_predictor, rgb)
-    fwd_flow = torch.from_numpy(fwd_flow)
-    bwd_flow = torch.from_numpy(bwd_flow)
-    
-    #torch.cuda.empty_cache()
+            first_detection = unique_masks.unsqueeze(1) # [N, H, W] -> [N, 1, H, W]
 
     # Run inference model
-    first_detection = detections[0][0]
+    processor = Propagator(predictor, detector, flow_predictor, rgb, det_aug, filter_labels=False)
+    #processor = Propagator(predictor, detector, flow_predictor, reid_net, rgb, det_aug, filter_labels=False)
     if first_detection.shape[0] > 0:
-        processor = Propagator(predictor, detector, rgb, 1, det_aug)
         with torch.no_grad():
-            boxes = processor.interact(first_detection, 0, rgb.shape[0],
-                                       fwd_flow, bwd_flow, detections)
+            print("Starting at frame", start_frame)
+            boxes = processor.interact(first_detection, mask_labels, start_frame, rgb.shape[0])
 
     # Postprocess predicted masks
-    merged_masks = torch.zeros((processor.t, 1, *size), dtype=torch.uint8, device='cuda')
-    out_masks = []
+    gif_frames = []
     for ti in range(processor.t):
-        prob = processor.prob[ti].float()
+        if len(processor.prob[ti]) > 0:
+            prob = torch.from_numpy(rle_decode(processor.prob[ti])).float().permute(2,0,1).unsqueeze(1) # [H, W, N] -> [N, 1, H, W]
+        else:
+            prob = torch.zeros((1, 1, *size))
         prob = F.interpolate(prob, size, mode='bilinear', align_corners=False)
-
-        merged_labels = torch.zeros((1, *size), dtype=torch.uint8, device='cuda')
-        num_objects = msk.shape[1]
-        labels_in_gt = np.arange(1, num_objects+1)
 
         # Swap Re-ID labels, do this in a backwards manner as that's how things get linked
         for i, label in enumerate(reversed(processor.valid_instances[ti])):
@@ -289,141 +323,89 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
                     # Otherwise just replace the valid instance ID
                     else:
                         processor.valid_instances[ti][new_prob_id] = torch.tensor(old, device='cuda')
-        
-                '''# If both old and new are valid, we need to merge labels
-                if torch.tensor(old, device='cuda') in processor.valid_instances[ti]:
-                    old_prob_id = processor.valid_instances[ti].tolist().index(torch.tensor(old, device='cuda'))
-                    prob[old_prob_id] = torch.clamp(prob[new_prob_id] + prob[old_prob_id], max=1.0)
-                # Otherwise we can just replace labels by replacing entries in valid_instances
-                else:
-                    # Keep replacing until we hit a GT label
-                    while(processor.valid_instances[ti][new_prob_id].item() in processor.reid_instance_mappings.keys()):
-                        new = processor.valid_instances[ti][new_prob_id]
-                        old = processor.reid_instance_mappings[new.item()]
-                        # Make sure we're not replacing GT labels
-                        processor.valid_instances[ti][new_prob_id] = torch.tensor(old, device='cuda')'''
 
         # Merge instance masks
+        merged_masks = torch.zeros((1, *size), dtype=torch.uint8)
         # Make sure we actually have valid instances
         if not torch.equal(processor.valid_instances[ti], torch.tensor([0], device='cuda')):
-            for prob_id, label in reversed(list(enumerate(processor.valid_instances[ti]))):
-                if label == -1:
+            valid_instances = list(processor.valid_instances[ti])
+            sorted_idxes = sorted(range(len(valid_instances)), key=lambda k: valid_instances[k], reverse=True)
+            for prob_id in sorted_idxes:
+                label = valid_instances[prob_id]
+                if label.item() == -1:
                     continue
                 mask = prob[prob_id] > 0.5
-                merged_labels = mask * (mask * label) + (~mask) * merged_labels
- 
-        merged_masks[ti] = merged_labels
-        out_masks.append(prob)
+                merged_masks = mask * (mask * label.item()) + (~mask) * merged_masks
+        merged_masks = merged_masks[0] # [1, H, W] -> [H, W]
+
+        prob = prob.squeeze(1).permute(1,2,0) # [N, 1, H, W] -> [H, W, N]
+        processor.prob[ti] = rle_encode(np.asfortranarray(prob.numpy()).astype(np.uint8))
     
-    merged_masks = (merged_masks.detach().cpu().numpy()[:,0]).astype(np.uint8)
+        merged_masks = merged_masks.numpy()
+
+        # Generate gif frames if needed
+        if args.output:
+            img_O = visualize_frame(data['rgb'][0][ti],
+                                    merged_masks,
+                                    processor.valid_instances[ti],
+                                    processor.reid_instance_mappings,
+                                    info['size'][0].item(),
+                                    info['size'][1].item(),
+                                    davis_palette,
+                                    boxes[ti-(start_frame+1)] if ti > start_frame else list())
+            gif_frames.append(img_O)
 
     #torch.cuda.synchronize()
     total_process_time += time.time() - process_begin
     total_frames += rgb.shape[0]
 
-    # Generate output json
-    # We will generate one json per video so we can parallelize
-    results = []
-    for inst_id in range(1, processor.total_instances):
-        instance_masks = []
-        for ti, out_mask in enumerate(out_masks):
-            if inst_id in processor.valid_instances[ti]:
-                mask_idx = processor.valid_instances[ti].tolist().index(inst_id)
-                seg = rle_encode(np.asfortranarray(out_mask[mask_idx][0].detach().cpu().numpy() > 0.5).astype(np.uint8))
-                seg['counts'] = seg['counts'].decode()
-                instance_masks.append(seg)
-            else:
-                instance_masks.append(None)
-        instance_dict = {
-            'video_id': vid_id.item(),
-            'score': 0.9, # We should replace this with detection scores at some point
-            'category_id': 1,
-            'segmentations': instance_masks
-        }
-        results.append(instance_dict)
-    #print(results)
-    results_json = json.dumps(results)
-    if args.output:
-        json_save_path = path.join(out_path, "json")
-        os.makedirs(json_save_path, exist_ok=True)
-        with open(path.join(json_save_path, "{:04d}.json".format(vid_id.item())), 'w') as f:
-            f.write(results_json)
-
     # Save the results
     if args.output:
 
-        this_out_path = path.join(out_path, "pred", name)
-        this_out_path2 = path.join(out_path, "vis")
-        this_out_path3 = path.join(out_path, "prompt", name)
-        os.makedirs(this_out_path, exist_ok=True)
-        os.makedirs(this_out_path2, exist_ok=True)
-        os.makedirs(this_out_path3, exist_ok=True)
-        gif_frames = []
-        for f in range(rgb.shape[0]):
-            
-            img_E = Image.fromarray(mask2rgb(merged_masks[f], davis_palette, torch.max(processor.valid_instances[f])).astype(np.uint8), mode='RGBA')
+        vis_save_path = path.join(out_path, "vis")
+        json_save_path = path.join(out_path, "json")
+        os.makedirs(vis_save_path, exist_ok=True)
+        os.makedirs(json_save_path, exist_ok=True)
 
-            img_E = img_E.convert('RGBA')
-            #img_E.putalpha(127)
-            img_E = img_E.resize((info['size'][1].item()//2, info['size'][0].item()//2))
-            img_O = Image.fromarray(data['orig_rgb'][0][f].numpy().astype(np.uint8))
-            img_O.putalpha(127)
-            img_O = img_O.resize((info['size'][1].item()//2, info['size'][0].item()//2))
-            img_O.paste(img_E, (0, 0), img_E)
+        # Generate output json
+        # We will generate one json per video so we can parallelize
+        results = []
+        for inst_id in range(1, processor.total_instances):
+            instance_masks = []
+            is_valid = False
+            cat_id = []
+            for ti in range(processor.t):
+                if inst_id in processor.valid_instances[ti]:
+                    mask_idx = processor.valid_instances[ti].tolist().index(inst_id)
+                    cat_id.append(processor.valid_labels[ti][mask_idx].item() + 1) # Shift category ID so it starts from 1 instead of 0
+                    seg = processor.prob[ti][mask_idx]
+                    seg['counts'] = seg['counts'].decode()
+                    instance_masks.append(seg)
+                    is_valid = True
+                else:
+                    instance_masks.append(None)
+            if is_valid:
+                instance_dict = {
+                    'video_id': vid_id.item(),
+                    'score': 0.9, # We should replace this with detection scores at some point
+                    'category_id': statistics.mode(cat_id), # Vote for the category ID
+                    'segmentations': instance_masks
+                }
+                results.append(instance_dict)
 
-            if f > 0:
-                if len(boxes[f-1]) > 0:
-                    draw = ImageDraw.Draw(img_O)
-                    for obj_id, box in reversed(list(enumerate(boxes[f-1]))):
-                        inst_id = processor.valid_instances[f][obj_id].item()
-                        while(inst_id in processor.reid_instance_mappings.keys()):
-                            inst_id = processor.reid_instance_mappings[inst_id]
-                        if inst_id != -1:
-                            draw.rectangle((torch.div(box, 2, rounding_mode='trunc')).tolist(), outline=tuple(davis_palette[inst_id%255]), width=2)
-                        '''if processor.valid_instances[f][obj_id].item() in processor.reid_instance_mappings:
-                            color = processor.reid_instance_mappings[processor.valid_instances[f][obj_id].item()]
-                        else:
-                            color = processor.valid_instances[f][obj_id]
-                        draw.rectangle((torch.div(box, 2, rounding_mode='trunc')).tolist(), outline=tuple(davis_palette[color%255]), width=2)'''
+        results_json = json.dumps(results)
+        with open(path.join(json_save_path, "{:04d}.json".format(vid_id.item())), 'w') as f:
+            f.write(results_json)
 
-            gif_frames.append(img_O)
-
-            '''if f+1 < rgb.shape[0]:
-                #print(name, processor.valid_instances[f+1], type(processor.valid_instances[f+1]))
-                img_prompt = Image.fromarray(data['orig_rgb'][0][f+1].numpy().astype(np.uint8))
-                img_prompt = img_prompt.resize((info['size'][1].item()//2, info['size'][0].item()//2))
-                img_E_next = img_prompt.copy()
-                img_E_next = Image.fromarray(mask2rgb(merged_masks[f+1], davis_palette, torch.max(processor.valid_instances[f+1])).astype(np.uint8))
-                img_E_next = img_E_next.convert('RGBA')
-                img_E_next.putalpha(127)
-                img_E_next = img_E_next.resize((info['size'][1].item()//2, info['size'][0].item()//2))
-                img_O_next = Image.fromarray(data['orig_rgb'][0][f+1].numpy().astype(np.uint8))
-                img_O_next = img_O_next.resize((info['size'][1].item()//2, info['size'][0].item()//2))
-                img_O_next.paste(img_E_next, (0, 0), img_E_next)
-                if len(boxes[f]) > 0:
-                    draw = ImageDraw.Draw(img_prompt)
-                    for obj_id, box in reversed(list(enumerate(boxes[f]))):
-                        if processor.valid_instances[f+1][obj_id].item() in processor.reid_instance_mappings:
-                            color = processor.reid_instance_mappings[processor.valid_instances[f+1][obj_id].item()]
-                        else:
-                            color = processor.valid_instances[f+1][obj_id]
-                        draw.rectangle((torch.div(box, 2, rounding_mode='trunc')).tolist(), outline=tuple(davis_palette[color]), width=3)
-                merged_prompt = Image.new('RGB', (img_O.width + img_prompt.width + img_O_next.width, img_O.height))
-                merged_prompt.paste(img_O, (0, 0))
-                merged_prompt.paste(img_prompt, (img_O.width, 0))
-                merged_prompt.paste(img_O_next, (img_O.width+img_prompt.width, 0))
-                merged_prompt.save(os.path.join(this_out_path3, '{:05d}.png'.format(f)))'''
-
-        gif_save_path = os.path.join(this_out_path2, name+".gif")
+        # Save gif
+        gif_save_path = os.path.join(vis_save_path, name+".gif")
         gif_frames[0].save(gif_save_path, format="GIF", append_images=gif_frames, save_all=True, interlace=False, duration=100, loop=0)
-
-        del gif_frames
 
     del rgb
     del predictions
-    del detections
     del processor
-    del msk
+    del gif_frames
+
 
 print('Total processing time: ', total_process_time)
 print('Total processed frames: ', total_frames)

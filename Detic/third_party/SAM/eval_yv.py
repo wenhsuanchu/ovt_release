@@ -12,7 +12,9 @@ from torch.utils.data import DataLoader
 from PIL import Image, ImageDraw
 from scipy.optimize import linear_sum_assignment
 import torch.multiprocessing
+import warnings
 
+warnings.filterwarnings("ignore")
 torch.multiprocessing.set_sharing_strategy('file_system')
 torch.backends.cudnn.benchmark = True
 
@@ -27,6 +29,7 @@ from detic.config import add_detic_config
 
 from detectron2.config import get_cfg
 from detectron2.modeling import build_model, GeneralizedRCNNWithTTA
+from detic.custom_tta import CustomRCNNWithTTA
 import detectron2.data.transforms as T
 from detectron2.structures import Instances, Boxes
 from detectron2.checkpoint import DetectionCheckpointer
@@ -34,7 +37,7 @@ from detectron2.checkpoint import DetectionCheckpointer
 from dataset.yv_dataset import YouTubeVOSTestDataset
 from utils.flow import run_flow_on_images
 from segment_anything import sam_model_registry, SamCustomPredictor
-from sam_propagator_yv import Propagator
+from sam_propagator_local2_detic2 import Propagator
 
 CKPT_PATH = "/home/wenhsuac/ovt/Detic/third_party/SAM/pretrained/sam_vit_h_4b8939.pth"
 
@@ -230,7 +233,8 @@ det_aug = T.ResizeShortestEdge(
     [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
 )
 
-tta_detector = GeneralizedRCNNWithTTA(cfg, detector)
+#tta_detector = GeneralizedRCNNWithTTA(cfg, detector)
+tta_detector = CustomRCNNWithTTA(cfg, detector)
 
 sam = sam_model_registry[model_type](checkpoint=CKPT_PATH)
 sam.to(device=device)
@@ -355,7 +359,7 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
         matched_detections[frame_with_gt] = gt_matched_detections[i]
     
     # Run inference model
-    processor = Propagator(predictor, detector, rgb, num_objects, det_aug)
+    processor = Propagator(predictor, detector, rgb, num_objects, det_aug, filter_labels=True)
     #print("NUM OBJ", num_objects)
     with torch.no_grad():
         # min_idx tells us the starting point of propagation

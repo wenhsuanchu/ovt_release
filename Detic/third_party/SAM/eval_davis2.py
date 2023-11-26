@@ -20,7 +20,9 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 from progressbar import progressbar
 
 sys.path.insert(0, '../../../dinov2')
+sys.path.insert(0, '../')
 sys.path.insert(0, '../../')
+sys.path.insert(0, '../../../')
 sys.path.insert(0, '../CenterNet2/')
 sys.path.insert(0, '../gmflow/')
 from gmflow.gmflow import GMFlow
@@ -34,14 +36,15 @@ import detectron2.data.transforms as T
 from detectron2.checkpoint import DetectionCheckpointer
 
 #from STCN.model.eval_network import STCN
-import hubconf
+#import hubconf
+#from reid_net.model.model_base import ModelBase as ReIDNet
 
 from dataset.davis_dataset import DAVISTestDataset
 from dataset.davis_metrics import db_eval_boundary, db_eval_iou
 from segment_anything import sam_model_registry, SamCustomPredictor
 #from segment_anything_hq import sam_model_registry, SamCustomPredictor
 #from sam_propagator import Propagator
-from sam_propagator_local2 import Propagator
+from sam_propagator_local2_detic import Propagator
 from ytvostools.mask import decode as rle_decode
 
 CKPT_PATH = "/home/wenhsuac/ovt/Detic/third_party/SAM/pretrained/sam_vit_h_4b8939.pth"
@@ -232,7 +235,21 @@ flow_predictor = GMFlow(feature_channels=128,
                         ).to(device)
 flow_predictor.eval()
 
-#dino = hubconf.dinov2_vits14().cuda().eval()
+#reid_net = hubconf.dinov2_vits14().cuda().eval()
+#reid_net = ReIDNet(0, '/home/wenhsuac/ovt/reid_net/pretrained/swin_tiny_pretrained.pth').cuda()
+#ckpt = torch.load('/home/wenhsuac/ovt/reid_net/ckpts/finetune_nobg/iter_030000.pth')
+#reid_net.load_state_dict(ckpt['model'])
+
+# reid_net = STCN().cuda().eval()
+
+# # Performs input mapping such that stage 0 model can be loaded
+# prop_saved = torch.load('/home/wenhsuac/ovt/Detic/third_party/STCN/saves/stcn.pth')
+# for k in list(prop_saved.keys()):
+#     if k == 'value_encoder.conv1.weight':
+#         if prop_saved[k].shape[1] == 4:
+#             pads = torch.zeros((64,1,7,7), device=prop_saved[k].device)
+#             prop_saved[k] = torch.cat([prop_saved[k], pads], 1)
+# reid_net.load_state_dict(prop_saved)
 
 checkpoint = torch.load('/home/wenhsuac/ovt/Detic/third_party/gmflow/pretrained/gmflow_with_refine_sintel-3ed1cf48.pth')
 weights = checkpoint['model'] if 'model' in checkpoint else checkpoint
@@ -255,7 +272,7 @@ sam = sam_model_registry[model_type](checkpoint=CKPT_PATH)
 sam.to(device=device)
 predictor = SamCustomPredictor(sam)
 
-test_dataset = DAVISTestDataset(davis_path, resolution=(480,720), imset='2017/val.txt')
+test_dataset = DAVISTestDataset(davis_path, resolution=(480,720), imset='2017/debug.txt')
 test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2)
 
 total_process_time = 0
@@ -352,7 +369,7 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
     first_detection = matched_detections[0][0]'''
     # Run inference model
     if first_detection.shape[0] > 0:
-        processor = Propagator(predictor, detector, flow_predictor, None, rgb, det_aug)
+        processor = Propagator(predictor, detector, flow_predictor, rgb, det_aug)
         with torch.no_grad():
             boxes = processor.interact(first_detection, first_detection_labels, 0, rgb.shape[0])
 
@@ -366,7 +383,7 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
         prob = F.interpolate(prob, size, mode='bilinear', align_corners=False)
         num_instances = prob.shape[0]
         
-        bg_mask = torch.ones((1,)+prob.shape[1:]) * 0.01
+        '''bg_mask = torch.ones((1,)+prob.shape[1:]) * 0.01
         prob = torch.cat([bg_mask, prob], dim=0)
         out_labels = torch.argmax(prob, dim=0)
         replaced_labels = out_labels.clone()
@@ -378,7 +395,41 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
         for i, (new, old) in enumerate(reversed(processor.reid_instance_mappings.items())):
             replaced_labels[replaced_labels==new] = old
  
-        out_masks[ti] = replaced_labels[0]
+        out_masks[ti] = replaced_labels[0]'''
+
+        # Swap Re-ID labels, do this in a backwards manner as that's how things get linked
+        for i, label in enumerate(reversed(processor.valid_instances[ti])):
+            if label.item() in processor.reid_instance_mappings.keys():
+                new_prob_id = processor.valid_instances[ti].tolist().index(label)
+                # Keep replacing until we hit the end
+                while(processor.valid_instances[ti][new_prob_id].item() in processor.reid_instance_mappings.keys()):
+                    new = processor.valid_instances[ti][new_prob_id]
+                    old = processor.reid_instance_mappings[new.item()]
+                    # If both old and new are valid, we need to merge labels
+                    # Then we can break the loop and handle the rest later
+                    if torch.tensor(old, device='cuda') in processor.valid_instances[ti]:
+                        old_prob_id = processor.valid_instances[ti].tolist().index(torch.tensor(old, device='cuda'))
+                        prob[old_prob_id] = torch.clamp(prob[new_prob_id] + prob[old_prob_id], max=1.0)
+                        # Mark invalid because we have the old instance already
+                        processor.valid_instances[ti][new_prob_id] = -1
+                        break
+                    # Otherwise just replace the valid instance ID
+                    else:
+                        processor.valid_instances[ti][new_prob_id] = torch.tensor(old, device='cuda')
+
+        # Merge instance masks
+        merged_masks = torch.zeros((1, *size), dtype=torch.uint8)
+        # Make sure we actually have valid instances
+        if not torch.equal(processor.valid_instances[ti], torch.tensor([0], device='cuda')):
+            valid_instances = list(processor.valid_instances[ti])
+            sorted_idxes = sorted(range(len(valid_instances)), key=lambda k: valid_instances[k], reverse=True)
+            for prob_id in sorted_idxes:
+                label = valid_instances[prob_id]
+                if label.item() == -1:
+                    continue
+                mask = prob[prob_id] > 0.5
+                merged_masks = mask * (mask * label.item()) + (~mask) * merged_masks
+        out_masks[ti] = merged_masks[0] # [1, H, W] -> [H, W]
     
     out_masks = out_masks.numpy().astype(np.uint8)
 
@@ -444,10 +495,17 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
             if f > 0:
                 if len(boxes[f-1]) > 0:
                     draw = ImageDraw.Draw(img_O)
-                    for obj_id, box in reversed(list(enumerate(boxes[f-1]))):
-                        inst_id = processor.valid_instances[f][obj_id].item()
+                    inst_ids = list(processor.valid_instances[f])[:len(boxes[f-1])]
+                    sorted_idx = sorted(range(len(inst_ids)), key=lambda k: inst_ids[k], reverse=True)
+                    for idx in sorted_idx:
+                        inst_id = inst_ids[idx]
                         while(inst_id in processor.reid_instance_mappings.keys()):
                             inst_id = processor.reid_instance_mappings[inst_id]
+                        box = boxes[f-1][idx]
+                    # for obj_id, box in reversed(list(enumerate(boxes[f-1]))):
+                    #     inst_id = processor.valid_instances[f][obj_id].item()
+                    #     while(inst_id in processor.reid_instance_mappings.keys()):
+                    #         inst_id = processor.reid_instance_mappings[inst_id]
                         if inst_id != -1:
                             try:
                                 draw.rectangle(box.tolist(), outline=tuple(davis_palette[inst_id%255]), width=2)
@@ -456,7 +514,7 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
                                 print("Warning: Invalid box")
                                 pass
 
-            '''if f+1 < rgb.shape[0]:
+            if f+1 < rgb.shape[0]:
                 #print(name, processor.valid_instances[f+1], type(processor.valid_instances[f+1]))
                 img_prompt = Image.fromarray(data['orig_rgb'][0][f+1].numpy().astype(np.uint8))
                 img_prompt = img_prompt.resize((size[1], size[0]))
@@ -479,7 +537,7 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
                 merged_prompt.paste(img_O, (0, 0))
                 merged_prompt.paste(img_prompt, (img_O.width, 0))
                 merged_prompt.paste(img_O_next, (img_O.width+img_prompt.width, 0))
-                #merged_prompt.save(os.path.join(this_out_path3, '{:05d}.png'.format(f)))'''
+                merged_prompt.save(os.path.join(this_out_path3, '{:05d}.png'.format(f)))
 
             merged = Image.new('RGB', (img_O.width + img_O2.width, img_O.height))
             merged.paste(img_O, (0, 0))

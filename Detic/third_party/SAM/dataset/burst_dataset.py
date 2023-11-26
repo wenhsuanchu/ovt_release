@@ -36,6 +36,8 @@ class BURSTTestDataset(Dataset):
 
         images = []
         paths = video.annotated_image_paths if self.annotated_only else video.all_images_paths[::5]
+        paths = list(set(paths + video.annotated_image_paths))
+        paths.sort()
         info['processed_frames'] = paths
         for i, f in enumerate(paths):
             img = Image.open(path.join(video._images_dir, f)).convert("RGB")

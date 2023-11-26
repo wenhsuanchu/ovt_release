@@ -14,9 +14,9 @@ from dataset.util import all_to_onehot
 
 class YouTubeVOSTestDataset(Dataset):
     def __init__(self, data_root, split='valid', load_backward=False):
-        self.image_dir = path.join(data_root, 'all_frames', split+'_all_frames', 'JPEGImages_480')
+        self.image_dir = path.join(data_root, 'all_frames', split+'_all_frames', 'JPEGImages')
         self.orig_image_dir = path.join(data_root, 'all_frames', split+'_all_frames', 'JPEGImages')
-        self.mask_dir = path.join(data_root, split, 'Annotations_480')
+        self.mask_dir = path.join(data_root, split, 'Annotations')
 
         self.videos = []
         self.shape = {}
@@ -36,8 +36,8 @@ class YouTubeVOSTestDataset(Dataset):
             _mask = np.array(Image.open(path.join(self.mask_dir, vid, first_mask)).convert("P"))
             self.shape[vid] = np.shape(_mask)
 
-            self.mask_transform = transforms.Compose([
-            ])
+        self.img_transform = transforms.Resize(480, interpolation=InterpolationMode.BILINEAR, antialias=True)
+        self.mask_transform = transforms.Resize(480, interpolation=InterpolationMode.NEAREST)
 
     def __getitem__(self, idx):
         video = self.videos[idx]
@@ -47,24 +47,22 @@ class YouTubeVOSTestDataset(Dataset):
         info['size'] = self.shape[video] # Real sizes
         info['gt_obj'] = {} # Frames with labelled objects
 
-        orig_vid_im_path = path.join(self.orig_image_dir, video)
         vid_im_path = path.join(self.image_dir, video)
         vid_gt_path = path.join(self.mask_dir, video)
 
         frames = self.frames[video]
 
-        orig_images = []
         images = []
         masks = []
         for i, f in enumerate(frames):
 
             img = Image.open(path.join(vid_im_path, f)).convert('RGB')
-            orig_images.append(torch.from_numpy(np.array(img)))
+            orig_shape = np.array(img).shape[:2]
+            img = np.array(self.img_transform(img))
             images.append(np.array(img))
 
             if i == 0:
-                orig_img = Image.open(path.join(orig_vid_im_path, f)).convert('RGB')
-                info['shape'] = np.array(orig_img).shape[:2]
+                info['shape'] = np.array(img).shape[:2]
             
             mask_file = path.join(vid_gt_path, f.replace('.jpg','.png'))
             if path.exists(mask_file):
@@ -74,10 +72,9 @@ class YouTubeVOSTestDataset(Dataset):
                 info['gt_obj'][i] = this_labels
             else:
                 # Mask not exists -> nothing in it
-                masks.append(np.zeros((images[0].shape[0], images[0].shape[1])))
+                masks.append(np.zeros((orig_shape[0], orig_shape[1])))
             
         
-        orig_images = torch.stack(orig_images, 0)
         images = np.stack(images, 0)
         masks = np.stack(masks, 0)
         
@@ -103,7 +100,6 @@ class YouTubeVOSTestDataset(Dataset):
         info['labels'] = labels
 
         data = {
-            'orig_rgb': orig_images,
             'rgb': images,
             'gt': masks,
             'info': info,

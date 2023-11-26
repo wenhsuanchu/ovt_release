@@ -34,7 +34,7 @@ from detectron2.checkpoint import DetectionCheckpointer
 
 from dataset.burst_dataset import BURSTTestDataset
 from segment_anything import sam_model_registry, SamCustomPredictor
-from sam_propagator_local import Propagator
+from sam_propagator_local2_detic import Propagator
 from ytvostools.mask import encode as rle_encode
 from ytvostools.mask import decode as rle_decode
 
@@ -247,8 +247,11 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
     process_begin = time.time()
     print(name, vid_id, size, rgb.shape)
 
-    if os.path.exists(path.join(out_path, "json", "{:04d}.json".format(vid_id.item()))):
+    if name != 'v_b74458f740348cd7c26b4c4339e0c5d6' and name != 'v_de4f3f3b37c91ead1c2f8b67909c694':
         continue
+
+    #if os.path.exists(path.join(out_path, "json", "{:04d}.json".format(vid_id.item()))):
+    #    continue
 
     detections = []
     detection_labels = []
@@ -400,9 +403,9 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
             f.write(results_json)
 
         # Save gif
-        if test_id % 10 == 0:
-            gif_save_path = os.path.join(vis_save_path, name+".gif")
-            gif_frames[0].save(gif_save_path, format="GIF", append_images=gif_frames, save_all=True, interlace=False, duration=100, loop=0)
+        #if test_id % 10 == 0:
+        gif_save_path = os.path.join(vis_save_path, name+".gif")
+        gif_frames[0].save(gif_save_path, format="GIF", append_images=gif_frames, save_all=True, interlace=False, duration=100, loop=0)
 
     del rgb
     del predictions

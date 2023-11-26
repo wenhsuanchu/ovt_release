@@ -1,13 +1,10 @@
 from os import path
 
-import torch
 from torch.utils.data.dataset import Dataset
-from torchvision import transforms
 from PIL import Image
 import numpy as np
 
 from ytvostools.ytvos import YTVOS
-from ytvostools.mask import decode as rle_decode
 
 #frame_dir = '/projects/katefgroup/datasets/UVO/uvo_videos_dense_frames'
 #annFile = '/projects/katefgroup/datasets/UVO/VideoDenseSet/UVO_video_val_dense.json'
@@ -35,25 +32,15 @@ class UVOTestDataset(Dataset):
         info['size'] = (vid['height'], vid['width']) # Real sizes
 
         images = []
-        orig_images = []
-        #masks = np.stack([rle_decode(anns[i]['segmentations']) for i in range(len(anns))], 0) # [N, H, W, S]
         for i, f in enumerate(vid['file_names']):
 
             img = Image.open(path.join(self.image_dir, f)).convert('RGB')
-            orig_images.append(torch.from_numpy(np.array(img)))
             images.append(np.array(img))
 
-        orig_images = torch.stack(orig_images, 0)
         images = np.stack(images, 0)
 
-        #masks = torch.from_numpy(masks).permute(3,0,1,2).float() # [N, H, W, S] -> [S, N, H, W]
-        masks = torch.zeros(images.shape[0], 1, info['size'][0], info['size'][1])
-        masks = masks.unsqueeze(2)
-
         data = {
-            'orig_rgb': orig_images,
             'rgb': images,
-            'gt': masks,
             'info': info,
         }
 
