@@ -19,25 +19,25 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 torch.backends.cudnn.benchmark = True
 
 from progressbar import progressbar
-
-sys.path.insert(0, '../../')
-sys.path.insert(0, '../CenterNet2/')
-sys.path.insert(0, '../gmflow/')
+sys.path.insert(0, './')
+sys.path.insert(0, './Detic/third_party/')
+sys.path.insert(0, './Detic/')
+sys.path.insert(0, './Detic/third_party/CenterNet2/')
+sys.path.insert(0, './Detic/third_party//gmflow/')
 from gmflow.gmflow import GMFlow
 from centernet.config import add_centernet_config
 from detic.config import add_detic_config
 
 from detectron2.config import get_cfg
-from detectron2.modeling import build_model, GeneralizedRCNNWithTTA
+from detectron2.modeling import build_model
 from detic.custom_tta import CustomRCNNWithTTA
 import detectron2.data.transforms as T
-from detectron2.structures import Instances, Boxes
 from detectron2.checkpoint import DetectionCheckpointer
 
 from dataset.yv_dataset import YouTubeVOSTestDataset
 from utils.flow import run_flow_on_images
 from segment_anything import sam_model_registry, SamCustomPredictor
-from sam_propagator_local2_detic2 import Propagator
+from propagator.sam_propagator_yv import Propagator
 
 CKPT_PATH = "/home/wenhsuac/ovt/Detic/third_party/SAM/pretrained/sam_vit_h_4b8939.pth"
 
@@ -81,8 +81,6 @@ def find_matching_masks(detected, gt, iou_thresh=0.0):
 
     # Detected: [N, 1, H, W]
     # GT: [N2, 1, H, W]
-    #print(detected.shape)
-    #print(gt.shape)
 
     # Convert to boolean masks
     detected = detected.bool().cpu() # [N1, 1, H, W]
@@ -92,8 +90,6 @@ def find_matching_masks(detected, gt, iou_thresh=0.0):
     union = torch.logical_or(detected, gt).float().sum((-2, -1))
     
     iou = (intersection + 1e-6) / (union + 1e-6) # [N1, N2]
-    #print(iou)
-    #input()
     thresholded = iou # When we add semantic label thresholding
     row_idx, col_idx = linear_sum_assignment(-thresholded) # Score -> cost
     matched_idxes = np.stack([row_idx, col_idx], axis=1)
@@ -233,7 +229,6 @@ det_aug = T.ResizeShortestEdge(
     [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
 )
 
-#tta_detector = GeneralizedRCNNWithTTA(cfg, detector)
 tta_detector = CustomRCNNWithTTA(cfg, detector)
 
 sam = sam_model_registry[model_type](checkpoint=CKPT_PATH)
@@ -255,8 +250,6 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
     if os.path.exists(path.join(out_path, 'vis', data['info']['name'][0])):
         continue
 
-    #torch.cuda.empty_cache()
-
     rgb = data['rgb'][0] # [B, S, H, W, C] -> [S, H, W, C]
     msk = data['gt'][0].to(sam.device)
     info = data['info']
@@ -264,12 +257,7 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
     num_objects = len(info['labels'][0])
     gt_obj = info['gt_obj']
     size = info['shape']
-    #torch.cuda.synchronize()
     process_begin = time.time()
-    print(name, rgb.shape)
-
-    #if name == 'c16d9a4ade' or name == '6eaf926e75':
-    #    continue
 
     detections = []
     detection_labels = []
@@ -294,8 +282,6 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
     fwd_flow, bwd_flow = run_flow_on_images(flow_predictor, rgb)
     fwd_flow = torch.from_numpy(fwd_flow)
     bwd_flow = torch.from_numpy(bwd_flow)
-    
-    #torch.cuda.empty_cache()
 
     # Frames with labels, but they are not exhaustively labeled
     frames_with_gt = sorted(list(gt_obj.keys()))
@@ -332,7 +318,7 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
             matched_detections_label.append({"t": frame_with_gt,
                                             "labels": torch.cat([matched_detections_label[-1]["labels"],
                                                                 matched_labels])})
-    #print("MATCHED DET LABELS", matched_detections_label)
+
     # Store detections with the same class labels
     matched_detections = []
     curr_frame_with_gt_idx = 0
@@ -360,7 +346,6 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
     
     # Run inference model
     processor = Propagator(predictor, detector, rgb, num_objects, det_aug, filter_labels=True)
-    #print("NUM OBJ", num_objects)
     with torch.no_grad():
         # min_idx tells us the starting point of propagation
         # Propagating before there are labels is not useful
@@ -373,7 +358,6 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
             obj_idx = [info['label_convert'][o].item() for o in obj_idx]
 
             start_detection = matched_detections[frame_idx][0]
-            print(start_detection.shape, len(obj_idx))
             if start_detection.shape[0] > 0:
                 # We perform propagation from the current frame to the next frame with label
                 start_detection = start_detection[[x - 1 for x in obj_idx]]
@@ -392,7 +376,6 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
 
         out_labels = torch.zeros((1, *size), dtype=torch.uint8, device='cuda')
         labels_in_gt = np.arange(1, num_objects+1)
-        #print(ti, "VALID", processor.valid_instances[ti])
         # Swap Re-ID labels, do this in a backwards manner as that's how things get linked
         for i, label in enumerate(reversed(processor.valid_instances[ti])):
             if label.item() in processor.reid_instance_mappings.keys():
@@ -440,7 +423,6 @@ for data in progressbar(test_loader, max_value=len(test_loader), redirect_stdout
     total_frames += rgb.shape[0]
     
     # Remap the indices to the original domain
-    #print("LABEL BACK", info['label_backward'])
     idx_masks = np.zeros_like(out_masks)
     for i in range(1, num_objects+1):
         backward_idx = info['label_backward'][i].item()

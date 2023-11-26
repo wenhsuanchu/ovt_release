@@ -1,4 +1,0 @@
-Total processing time:  4455.121214151382
-Total processed frames:  1999
-FPS:  0.44869710697215504
-mIOU:  tensor(0.7650)

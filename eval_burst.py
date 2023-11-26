@@ -18,30 +18,24 @@ warnings.filterwarnings("ignore")
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 from progressbar import progressbar
-
-sys.path.insert(0, '../../../dinov2')
-sys.path.insert(0, '../')
-sys.path.insert(0, '../../')
-sys.path.insert(0, '../../../')
-sys.path.insert(0, '../CenterNet2/')
-sys.path.insert(0, '../gmflow/')
+sys.path.insert(0, './')
+sys.path.insert(0, './Detic/third_party/')
+sys.path.insert(0, './Detic/')
+sys.path.insert(0, './Detic/third_party/CenterNet2/')
+sys.path.insert(0, './Detic/third_party//gmflow/')
 from gmflow.gmflow import GMFlow
 from centernet.config import add_centernet_config
 from detic.config import add_detic_config
 
 from detectron2.config import get_cfg
-from detectron2.modeling import build_model, GeneralizedRCNNWithTTA
+from detectron2.modeling import build_model
 from detic.custom_tta import CustomRCNNWithTTA
 import detectron2.data.transforms as T
 from detectron2.checkpoint import DetectionCheckpointer
 
-from STCN.model.eval_network import STCN
-import hubconf
-from reid_net.model.model_base import ModelBase as ReIDNet
-
-from dataset.uvo_dataset import UVOTestDataset
+from dataset.burst_dataset import BURSTTestDataset
 from segment_anything import sam_model_registry, SamCustomPredictor
-from sam_propagator_local2_detic2 import Propagator
+from propagator.sam_propagator_local import Propagator
 from ytvostools.mask import encode as rle_encode
 from ytvostools.mask import decode as rle_decode
 
@@ -63,7 +57,7 @@ def setup_cfg(args):
     if args.pred_one_class:
         cfg.MODEL.ROI_HEADS.ONE_CLASS_PER_PROPOSAL = True
     cfg.TEST.AUG.FLIP = True
-    cfg.TEST.AUG.MIN_SIZES = [int(cfg.INPUT.MIN_SIZE_TEST*0.5), int(cfg.INPUT.MIN_SIZE_TEST*0.75), cfg.INPUT.MIN_SIZE_TEST, int(cfg.INPUT.MIN_SIZE_TEST*1.25), int(cfg.INPUT.MIN_SIZE_TEST*1.5)]
+    cfg.TEST.AUG.MIN_SIZES = [int(cfg.INPUT.MIN_SIZE_TEST*0.75), cfg.INPUT.MIN_SIZE_TEST, int(cfg.INPUT.MIN_SIZE_TEST*1.25)]
     cfg.TEST.AUG.MAX_SIZE = cfg.INPUT.MAX_SIZE_TEST
     cfg.vocabulary = args.vocabulary
     if args.custom_vocabulary is not None:
@@ -99,8 +93,8 @@ def mask2rgb(mask, palette, max_id):
             rgb[mask==i] = palette[i%255]
             alpha[mask==i] = 0
             '''elif i == 1:
-            rgb[mask==i] = np.array([255,0,212])
-            alpha[mask==i] = 200'''
+                rgb[mask==i] = np.array([255,0,212])
+                alpha[mask==i] = 200'''
         else:
             rgb[mask==i] = palette[i%255]
             alpha[mask==i] = 200
@@ -126,7 +120,12 @@ def visualize_frame(rgb, merged_masks, valid_instances, reid_mappings, height, w
             while(inst_id in reid_mappings.keys()):
                 inst_id = reid_mappings[inst_id]
             if inst_id != -1:
-                draw.rectangle(box.tolist(), outline=tuple(palette[inst_id%255]), width=2)
+                try:
+                    draw.rectangle(box.tolist(), outline=tuple(davis_palette[inst_id%255]), width=2)
+                except ValueError:
+                    # Sometimes the box is invalid, just move along and hope for the best.
+                    print("Warning: Invalid box")
+                    pass
     
     return img_O
 
@@ -135,7 +134,7 @@ Arguments loading
 """
 parser = ArgumentParser()
 parser.add_argument('--model', default='saves/stcn.pth')
-parser.add_argument('--uvo_path', default='/projects/katefgroup/datasets/UVO/')
+parser.add_argument('--burst_path', default='/projects/katefgroup/datasets/BURST/')
 parser.add_argument('--output')
 parser.add_argument('--load_backward', action='store_true')
 parser.add_argument('--split', help='val/testdev', default='val')
@@ -183,7 +182,7 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-uvo_path = args.uvo_path
+burst_path = args.burst_path
 out_path = args.output
 
 # Simple setup
@@ -208,21 +207,6 @@ flow_predictor = GMFlow(feature_channels=128,
                         ).to(device)
 flow_predictor.eval()
 
-#reid_net = hubconf.dinov2_vits14().cuda().eval()
-#reid_net = STCN().cuda().eval()
-reid_net = ReIDNet(9, '/home/wenhsuac/ovt/reid_net/pretrained/swin_tiny_pretrained.pth').cuda()
-ckpt = torch.load('/home/wenhsuac/ovt/reid_net/ckpts/finetune/iter_030000.pth')
-reid_net.load_state_dict(ckpt['model'])
-
-#Performs input mapping such that stage 0 model can be loaded
-# prop_saved = torch.load('/home/wenhsuac/ovt/Detic/third_party/STCN/saves/stcn.pth')
-# for k in list(prop_saved.keys()):
-#     if k == 'value_encoder.conv1.weight':
-#         if prop_saved[k].shape[1] == 4:
-#             pads = torch.zeros((64,1,7,7), device=prop_saved[k].device)
-#             prop_saved[k] = torch.cat([prop_saved[k], pads], 1)
-# reid_net.load_state_dict(prop_saved)
-
 checkpoint = torch.load('/home/wenhsuac/ovt/Detic/third_party/gmflow/pretrained/gmflow_with_refine_sintel-3ed1cf48.pth')
 weights = checkpoint['model'] if 'model' in checkpoint else checkpoint
 flow_predictor.load_state_dict(weights)
@@ -237,14 +221,13 @@ det_aug = T.ResizeShortestEdge(
     [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
 )
 
-#tta_detector = GeneralizedRCNNWithTTA(cfg, detector)
 tta_detector = CustomRCNNWithTTA(cfg, detector)
 
 sam = sam_model_registry[model_type](checkpoint=CKPT_PATH)
 sam.to(device=device)
 predictor = SamCustomPredictor(sam)
 
-test_dataset = UVOTestDataset(uvo_path, load_backward=args.load_backward)
+test_dataset = BURSTTestDataset(os.path.join(burst_path, 'val', 'all_classes.json'), os.path.join(burst_path, 'frames'), annotated_only=False)
 test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2)
 
 total_process_time = 0
@@ -252,20 +235,18 @@ total_frames = 0
 
 for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loader), redirect_stdout=True)):
 
-    #torch.cuda.empty_cache()
-    #if test_id > 3: break
-
     rgb = data['rgb'][0] # [B, S, H, W, C] -> [S, H, W, C]
     info = data['info']
     name = info['name'][0]
     vid_id = info['id']
     size = info['size']
-    #torch.cuda.synchronize()
     process_begin = time.time()
-    print(name, size, rgb.shape)
 
     if os.path.exists(path.join(out_path, "json", "{:04d}.json".format(vid_id.item()))):
-        continue
+       continue
+
+    detections = []
+    detection_labels = []
 
     # Run the detector until we get some detection
     first_detection = []
@@ -288,8 +269,7 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
             first_detection = unique_masks.unsqueeze(1) # [N, H, W] -> [N, 1, H, W]
 
     # Run inference model
-    processor = Propagator(predictor, detector, flow_predictor, rgb, det_aug, filter_labels=False)
-    #processor = Propagator(predictor, detector, flow_predictor, reid_net, rgb, det_aug, filter_labels=False)
+    processor = Propagator(predictor, detector, flow_predictor, rgb, det_aug)
     if first_detection.shape[0] > 0:
         with torch.no_grad():
             print("Starting at frame", start_frame)
@@ -328,10 +308,7 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
         merged_masks = torch.zeros((1, *size), dtype=torch.uint8)
         # Make sure we actually have valid instances
         if not torch.equal(processor.valid_instances[ti], torch.tensor([0], device='cuda')):
-            valid_instances = list(processor.valid_instances[ti])
-            sorted_idxes = sorted(range(len(valid_instances)), key=lambda k: valid_instances[k], reverse=True)
-            for prob_id in sorted_idxes:
-                label = valid_instances[prob_id]
+            for prob_id, label in reversed(list(enumerate(processor.valid_instances[ti]))):
                 if label.item() == -1:
                     continue
                 mask = prob[prob_id] > 0.5
@@ -349,13 +326,12 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
                                     merged_masks,
                                     processor.valid_instances[ti],
                                     processor.reid_instance_mappings,
-                                    info['size'][0].item(),
-                                    info['size'][1].item(),
+                                    info['size_480p'][0].item(),
+                                    info['size_480p'][1].item(),
                                     davis_palette,
-                                    boxes[ti-(start_frame+1)] if ti > start_frame else list())
+                                    boxes[ti-(start_frame+1)] if ti > start_frame+1 else list())
             gif_frames.append(img_O)
 
-    #torch.cuda.synchronize()
     total_process_time += time.time() - process_begin
     total_frames += rgb.shape[0]
 
@@ -369,29 +345,47 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
 
         # Generate output json
         # We will generate one json per video so we can parallelize
-        results = []
-        for inst_id in range(1, processor.total_instances):
-            instance_masks = []
-            is_valid = False
-            cat_id = []
-            for ti in range(processor.t):
-                if inst_id in processor.valid_instances[ti]:
-                    mask_idx = processor.valid_instances[ti].tolist().index(inst_id)
-                    cat_id.append(processor.valid_labels[ti][mask_idx].item() + 1) # Shift category ID so it starts from 1 instead of 0
-                    seg = processor.prob[ti][mask_idx]
-                    seg['counts'] = seg['counts'].decode()
-                    instance_masks.append(seg)
-                    is_valid = True
-                else:
-                    instance_masks.append(None)
-            if is_valid:
-                instance_dict = {
-                    'video_id': vid_id.item(),
-                    'score': 0.9, # We should replace this with detection scores at some point
-                    'category_id': statistics.mode(cat_id), # Vote for the category ID
-                    'segmentations': instance_masks
-                }
-                results.append(instance_dict)
+        all_segs = []
+        cat_ids = {}
+        for ti in range(processor.t): 
+            # Only add segmentations for the required frames
+            if info['processed_frames'][ti] in info['required_frames']:
+                instances = {}
+                for inst_id in range(1, processor.total_instances):
+                    if inst_id in processor.valid_instances[ti]:
+
+                        if inst_id not in cat_ids.keys():
+                            cat_ids[str(inst_id)] = []
+
+                        mask_idx = processor.valid_instances[ti].tolist().index(inst_id)
+                        cat_ids[str(inst_id)].append(processor.valid_labels[ti][mask_idx].item() + 1) # Shift category ID so it starts from 1 instead of 0
+                        seg = processor.prob[ti][mask_idx]
+                        seg = seg['counts'].decode()
+                        instances[str(inst_id)] = {
+                            'rle': seg,
+                            'is_gt': False,
+                            'score': 0.9 # We should replace this with detection scores at some point
+                        }
+
+                all_segs.append(instances)
+        # Vote for category ID
+        for inst_id in cat_ids.keys():
+            cat_ids[inst_id] = statistics.mode(cat_ids[inst_id])
+
+        results = {
+            'width': info['size'][1].item(),
+            'height': info['size'][0].item(),
+            'id': vid_id.item(),
+            'seq_name': name,
+            'dataset': info['dataset'][0],
+            'fps': 30,
+            'all_image_paths': [x[0] for x in info['all_frames']],
+            'annotated_image_paths': [x[0] for x in info['required_frames']],
+            'neg_category_ids': [x.item() for x in info['negative_category_ids']],
+            'not_exhaustive_category_ids': [x.item() for x in info['not_exhaustive_category_ids']],
+            'track_category_ids': cat_ids,
+            'segmentations': all_segs
+        }
 
         results_json = json.dumps(results)
         with open(path.join(json_save_path, "{:04d}.json".format(vid_id.item())), 'w') as f:
@@ -403,9 +397,8 @@ for test_id, data in enumerate(progressbar(test_loader, max_value=len(test_loade
 
     del rgb
     del predictions
+    del detections
     del processor
-    del gif_frames
-
 
 print('Total processing time: ', total_process_time)
 print('Total processed frames: ', total_frames)

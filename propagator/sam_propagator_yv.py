@@ -1,10 +1,13 @@
 import torch
 import torchvision
+import torchvision.transforms as T
+import torch.nn.functional as F
 import collections
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from detectron2.structures import Instances, Boxes
 from ytvostools.mask import encode as rle_encode
+from PIL import Image
 
 from utils.flow import run_flow_on_images
 
@@ -99,7 +102,7 @@ class Propagator:
             orig_box = masks_to_boxes(instance)
             start_boxes.append(orig_box)
         start_boxes = torch.stack(start_boxes)
-        start_boxes, start_box_feats, _ = self._refine_boxes(self.images[idx].numpy(), Boxes(start_boxes.cuda()))
+        start_boxes, start_box_feats, _ = self._refine_boxes(self.images[idx].numpy(), Boxes(start_boxes.cuda()), self.prob[idx])
         for i, start_box_feat in enumerate(start_box_feats):
             self.feat_hist[i].append(start_box_feat)
 
@@ -154,8 +157,11 @@ class Propagator:
                     if self.valid_instances[ti-1][prob_id] in self.new_instance_ids:
                         self.new_instance_ids.remove(self.valid_instances[ti-1][prob_id])
 
+                    hist_feats = list(self.feat_hist[self.valid_instances[ti-1][prob_id]-1])
+                    if len(hist_feats) > 1:
+                        hist_feats = hist_feats[:-1]
                     self.reid_instance_feats.append({"id": self.valid_instances[ti-1][prob_id],
-                                                     "feat": torch.stack(list(self.feat_hist[self.valid_instances[ti-1][prob_id]-1]))})
+                                                     "feat": torch.stack(hist_feats)})
                     
                     # Remove the oldest instance awaiting re-id if we have too many of them
                     if len(self.reid_instance_feats) > max_tracklets*2:
@@ -188,7 +194,7 @@ class Propagator:
             else:
                 # Refine boxes using box regressor
                 boxes = torch.stack(boxes)
-                boxes, box_feats, box_scores = self._refine_boxes(self.images[ti].numpy(), Boxes(boxes.to(self.device, non_blocking=True)))
+                boxes, _, box_scores = self._refine_boxes(self.images[ti].numpy(), Boxes(boxes.to(self.device, non_blocking=True)))
                 boxes = torch.round(boxes).long()
                 
                 # Skip instance and kill tracklet if box scores are low
@@ -197,17 +203,17 @@ class Propagator:
                 updated_prev_valid_embeddings = []
                 updated_prev_valid_masks = []
                 
-                for box_id, box_feat in enumerate(box_feats):
+                for box_id, box_score in enumerate(box_scores):
     
-                    box_score = box_scores[box_id]
                     if box_score < 0.35:
                         print(ti, "[Box Quality] Killing", valid_instances[box_id])
                         # If a new instance died before it got re-ided, then just remove the entry from new instances
                         if valid_instances[box_id] in self.new_instance_ids:
                             self.new_instance_ids.remove(valid_instances[box_id])
 
+                        hist_feats = list(self.feat_hist[valid_instances[box_id]-1])
                         self.reid_instance_feats.append({"id": valid_instances[box_id],
-                                                         "feat": torch.stack(list(self.feat_hist[valid_instances[box_id]-1]))})
+                                                         "feat": torch.stack(hist_feats)})
                         
                         # Remove the oldest instance awaiting re-id if we have too many of them
                         if len(self.reid_instance_feats) > max_tracklets*2:
@@ -253,10 +259,13 @@ class Propagator:
                     for prob_id, instance_mask in enumerate(out_masks):
                         instance = instance_mask[0]
                         new_boxes.append(masks_to_boxes(instance))
-                    _, box_feats, _ = self._refine_boxes(self.images[ti].numpy(),
-                                                         Boxes(torch.stack(new_boxes).to(self.device, non_blocking=True)))
+                    _, box_feats, box_scores = self._refine_boxes(self.images[ti].numpy(),
+                                                         Boxes(torch.stack(new_boxes).to(self.device, non_blocking=True)), out_masks)
                     for box_id, box_feat in enumerate(box_feats):
-                        self.feat_hist[valid_instances[box_id]-1].append(box_feat)
+                        if box_scores[box_id] > 0.35:
+                            self.feat_hist[valid_instances[box_id]-1].append(box_feat)
+                        else:
+                            print("Skipped", valid_instances[box_id], "in feat hist")
 
                     all_boxes.append(boxes)
 
@@ -316,7 +325,7 @@ class Propagator:
 
         return boxes
     
-    def _calc_flow_consistency(self, mask, fwd_flow, bwd_flow, thresh=1.1):
+    def _calc_flow_consistency(self, mask, fwd_flow, bwd_flow, thresh=0.7):
 
         H, W = mask.shape
         
@@ -430,9 +439,9 @@ class Propagator:
                     curr_instance_count += 1
                     valid_instances.append(torch.tensor(self.total_instances+1, device=self.device))
                     valid_labels.append(detection_labels[label_idx])
-                    self.feat_hist.append(collections.deque(maxlen=10))
+                    self.feat_hist.append(collections.deque(maxlen=9))
 
-                    _, new_box_feats, _ = self._refine_boxes(img, Boxes(masks_to_boxes(detection[label_idx][0]).unsqueeze(0))) # [1, C]
+                    _, new_box_feats, _ = self._refine_boxes(img, Boxes(masks_to_boxes(detection[label_idx][0]).unsqueeze(0)), detection[label_idx].unsqueeze(0)) # [1, C]
                     self.feat_hist[self.total_instances].append(new_box_feats.squeeze(0))
                     #print("NEW", self.total_instances+1)
                     self.new_instance_ids.append(self.total_instances+1)
@@ -458,17 +467,19 @@ class Propagator:
             curr_instance_idx += 1
             valid_instances.append(torch.tensor(self.total_instances+1, device=self.device))
             valid_labels.append(detection_labels[label_idx])
-            self.feat_hist.append(collections.deque(maxlen=10))
+            self.feat_hist.append(collections.deque(maxlen=9))
 
-            _, new_box_feats, _ = self._refine_boxes(img, Boxes(masks_to_boxes(detection[label_idx][0]).unsqueeze(0))) # [1, C]
+            _, new_box_feats, _ = self._refine_boxes(img, Boxes(masks_to_boxes(detection[label_idx][0]).unsqueeze(0)), detection[label_idx].unsqueeze(0)) # [1, C]
             self.feat_hist[self.total_instances].append(new_box_feats.squeeze(0))
             self.new_instance_ids.append(self.total_instances+1)
 
             self.total_instances += 1
 
         return merged_mask, valid_instances
-    
-    def _reid(self):
+
+    #0.8/0.75 for dino
+    #0.6/0.75 for detic
+    def _reid(self, matching_threshold=0.65, ratio_threshold=0.5):
 
         reid_count = 0
 
@@ -480,7 +491,8 @@ class Propagator:
             new_box_feat_ids = []
             new_box_feats = []
             for new_instance_id in self.new_instance_ids:
-                new_box_feats.append(torch.stack(list(self.feat_hist[new_instance_id-1])))
+                hist_feats = list(self.feat_hist[new_instance_id-1])
+                new_box_feats.append(torch.stack(hist_feats))
                 new_box_feat_ids.append(torch.full((len(self.feat_hist[new_instance_id-1]),), new_instance_id))
 
                 if len(self.feat_hist[new_instance_id-1]) == 10:
@@ -507,37 +519,29 @@ class Propagator:
                      - 2*torch.einsum('aij,bik->abjk', new_box_feats, killed_box_feats)) # [NEW, KILLED, HW, HW]
             num_feats_in_box = diffs.shape[-1]
             # Clamp match count to 1 because each feature can only match with at least one other feature
-            all_matches = torch.clamp((diffs < 0.4).sum(-1), max=1.).sum(-1) # [NEW, KILLED, HW, HW] -> [NEW, KILLED]
-            all_matches2 = torch.clamp((diffs < 0.4).sum(-2), max=1.).sum(-1) # [NEW, KILLED, HW, HW] -> [NEW, KILLED]
+            all_matches = torch.clamp((diffs < matching_threshold).sum(-1), max=1.).sum(-1) # [NEW, KILLED, HW, HW] -> [NEW, KILLED]
 
             # Use a mask to keep track of what has already been matched
             #matched_mask = torch.ones_like(all_matches[:1])
             matched_mask = torch.ones_like(all_matches)
             max_match = torch.max(all_matches*matched_mask)
             max_match_idx = (all_matches*matched_mask == max_match).nonzero()[0]
-            while max_match / num_feats_in_box > 0.5:
-                # Check if we get matches on both sides
-                #print("MAXMATCH", max_match, (all_matches2*matched_mask)[max_match_idx[0], max_match_idx[1]])
-                if (all_matches2*matched_mask)[max_match_idx[0], max_match_idx[1]] / num_feats_in_box < 0.5:
-                    matched_mask[max_match_idx[0], max_match_idx[1]] = 0
-                    max_match = torch.max(all_matches*matched_mask)
-                    max_match_idx = (all_matches*matched_mask == max_match).nonzero()[0]
-                else:
-                    new_id = new_box_feat_ids[max_match_idx[0]].item()
-                    old_id = killed_box_feat_ids[max_match_idx[1]].item()
-                    # Preent dupicate entries, since it's possible that multiple pairs of feats get matched at once
-                    if new_id not in self.reid_instance_mappings.keys():
-                        self.reid_instance_mappings[new_id] = old_id
-                        print("REID", new_id, "->", old_id)
-                        # Remove re-ided entries
-                        if new_id in self.new_instance_ids:
-                            self.new_instance_ids.remove(new_id)
-                        for entry in self.reid_instance_feats:
-                            if entry["id"].item() == old_id:
-                                self.reid_instance_feats.remove(entry)
-                    matched_mask = matched_mask * (~(killed_box_feat_ids == old_id)).cuda()#.unsqueeze(0)
-                    max_match = torch.max(all_matches*matched_mask)
-                    max_match_idx = (all_matches*matched_mask == max_match).nonzero()[0]
+            while max_match / num_feats_in_box > ratio_threshold:
+                new_id = new_box_feat_ids[max_match_idx[0]].item()
+                old_id = killed_box_feat_ids[max_match_idx[1]].item()
+                # Preent dupicate entries, since it's possible that multiple pairs of feats get matched at once
+                if new_id not in self.reid_instance_mappings.keys():
+                    self.reid_instance_mappings[new_id] = old_id
+                    print("REID", new_id, "->", old_id)
+                    # Remove re-ided entries
+                    if new_id in self.new_instance_ids:
+                        self.new_instance_ids.remove(new_id)
+                    for entry in self.reid_instance_feats:
+                        if entry["id"].item() == old_id:
+                            self.reid_instance_feats.remove(entry)
+                matched_mask = matched_mask * (~(killed_box_feat_ids == old_id)).cuda()#.unsqueeze(0)
+                max_match = torch.max(all_matches*matched_mask)
+                max_match_idx = (all_matches*matched_mask == max_match).nonzero()[0]
 
             # If the entry has persisted long enough before getting re-ided, don't try to re-id it
             for entry in no_longer_new:
@@ -657,7 +661,7 @@ class Propagator:
         #box = torch.tensor([min_x, min_y, max_x, max_y])
         return box
     
-    def _refine_boxes(self, img, boxes):
+    def _refine_boxes(self, img, boxes, masks=None):
 
         # img: [H, W, 3]
         # boxes: Boxes()
@@ -680,17 +684,28 @@ class Propagator:
 
         _, roi_dict = self.detector.roi_heads(images, features, proposals)
 
-        out_boxes = Boxes(roi_dict["boxes"][0].detach())
+        out_boxes = Boxes(torch.clone(roi_dict["boxes"][0].detach()))
         out_boxes.scale(inputs[0]["width"]/images.image_sizes[0][1],
                         inputs[0]["height"]/images.image_sizes[0][0])
         out_boxes.clip(images.image_sizes[0])
 
-        box_features = [features[f] for f in self.detector.roi_heads.box_in_features]
-        box_features = self.detector.roi_heads.box_pooler(box_features, [Boxes(roi_dict["boxes"][0].detach())])
-        box_features = torch.flatten(box_features, 2)
-        #mask_features = [features[f] for f in self.detector.roi_heads.in_features]
-        #mask_features = self.detector.roi_heads.mask_pooler(mask_features, [Boxes(roi_dict["boxes"][0].detach())])
-        #mask_features = torch.flatten(mask_features, 2)
+        feats_list = [features[f] for f in self.detector.roi_heads.box_in_features]
+        box_features = self.detector.roi_heads.box_pooler(feats_list, [Boxes(roi_dict["boxes"][0].detach())])
+        box_features = torch.flatten(box_features, 2).mean(-1, keepdim=True)
+
+        if masks is not None:
+            mask_features = []
+            featmap = feats_list[0].squeeze(0)
+            flattened_featmap = featmap.flatten(1)
+            flattened_masks = F.interpolate(masks.float(), featmap.shape[-2:], mode='bilinear', align_corners=False).flatten(1) # [N, 1, H, W] -> [N, H*W]
+            for idx, instance_mask in enumerate(flattened_masks):
+                pt_coords = (instance_mask > 0.5).nonzero(as_tuple=False).squeeze(1)  # [X]
+                if len(pt_coords) > 0:
+                    mask_features.append(flattened_featmap[:, pt_coords].mean(-1, keepdim=True))
+                else:
+                    mask_features.append(box_features[idx].mean(-1, keepdim=True))
+            mask_features = torch.stack(mask_features)
+            box_features = mask_features
 
         scores = torch.max(roi_dict["scores"][0], 1)[0]
 
