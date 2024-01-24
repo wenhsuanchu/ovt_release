@@ -1,5 +1,6 @@
-# Warning: Cleanup in progress!
-I'm currently cleaning up the code. It is recommended to check back later to avoid bugs.
+# Zero-Shot Open-Vocabulary Tracking with Large Pre-Trained Models
+Official PyTorch implementation for the paper "Zero-Shot Open-Vocabulary Tracking with Large Pre-Trained Models".
+[Project page] (https://wenhsuanchu.github.io/ovtracktor/)
 
 # ovt
 ```
