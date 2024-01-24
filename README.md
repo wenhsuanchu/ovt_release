@@ -1,6 +1,7 @@
 # Zero-Shot Open-Vocabulary Tracking with Large Pre-Trained Models
-Official PyTorch implementation for the paper "Zero-Shot Open-Vocabulary Tracking with Large Pre-Trained Models".
-[Project page] (https://wenhsuanchu.github.io/ovtracktor/)
+Official PyTorch implementation for the paper [Zero-Shot Open-Vocabulary Tracking with Large Pre-Trained Models](https://arxiv.org/abs/2310.06992).
+
+[[Project page](https://wenhsuanchu.github.io/ovtracktor/)] [[Paper](https://arxiv.org/pdf/2310.06992.pdf)]
 
 # ovt
 ```
